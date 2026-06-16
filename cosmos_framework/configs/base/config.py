@@ -94,6 +94,7 @@ def make_config() -> Config:
 
     # Register shipped experiments explicitly. (vision_sft_nano also defines
     # vision_sft_nano_mapstyle_dataloader — the CosmosDataLoader variant — in the same module.)
+    import cosmos_framework.configs.base.experiment.sft.robotwin_lerobot_action_sft_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_super  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano  # noqa: F401

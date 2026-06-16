@@ -21,6 +21,7 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
     "embodiment_c_gripper": 15,
     "embodiment_c_gripper_ext": 15,
     "fractal": 20,
+    "robotwin_lerobot": 21,
 }
 
 
@@ -39,6 +40,7 @@ EMBODIMENT_TO_RAW_ACTION_DIM: dict[str, int] = {
     "embodiment_c_gripper": 29,
     "embodiment_c_gripper_ext": 29,
     "fractal": 10,
+    "robotwin_lerobot": 14,
     # NOTE: ``libero`` (7/10/13 depending on ``rotation_space``) and ``hand_pose``
     # (variable with ``keypoint_option`` and ``rotation_format``) are absent
     # because their raw width is set per-dataset at construction time. Inference

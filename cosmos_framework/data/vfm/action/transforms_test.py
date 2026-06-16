@@ -292,6 +292,40 @@ def test_action_transform_pipeline_skips_idle_frames_for_inverse_dynamics_json_p
 
 
 @pytest.mark.L0
+def test_action_transform_pipeline_supports_multi_image_video_list() -> None:
+    pipeline = ActionTransformPipeline(
+        tokenizer_config=None,
+        max_action_dim=4,
+        append_duration_fps_timestamps=True,
+        append_resolution_info=True,
+        append_viewpoint_info=False,
+    )
+    videos = [torch.zeros(3, 17, 128, 160), torch.zeros(3, 17, 128, 160), torch.zeros(3, 17, 128, 160)]
+    action = torch.zeros(16, 2)
+    data_dict = {
+        "ai_caption": "<cam_high> image 1. <cam_left_wrist> image 2. <cam_right_wrist> image 3. Open the drawer.",
+        "video": videos,
+        "action": action,
+        "conditioning_fps": torch.tensor(8),
+        "mode": "policy",
+        "domain_id": torch.tensor(0),
+    }
+
+    result = pipeline(data_dict, resolution="256")
+
+    assert isinstance(result["video"], list)
+    assert len(result["video"]) == 3
+    assert all(item.shape == (3, 17, 256, 320) for item in result["video"])
+    assert isinstance(result["image_size"], list)
+    assert len(result["image_size"]) == 3
+    assert result["sequence_plan"].has_vision is True
+    assert result["sequence_plan"].has_action is True
+    assert "<cam_high> image 1" in result["ai_caption"]
+    assert "This video is of 256x320 resolution." in result["ai_caption"]
+    assert result["action"].shape == (16, 4)
+
+
+@pytest.mark.L0
 def test_action_prompt_json_formatter_matches_video_json_common_metadata() -> None:
     formatter = ActionPromptJsonFormatter()
     video = torch.zeros(3, 23, 192, 320)  # [C,T,H,W]

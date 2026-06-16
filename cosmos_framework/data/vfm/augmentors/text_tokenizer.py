@@ -5,11 +5,12 @@
 
 import json
 import random
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
+from cosmos_framework.data.vfm.sequence_packing import add_special_tokens
 from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 
 _MAX_NUM_TOKENS = 4096
@@ -18,12 +19,19 @@ _MAX_NUM_TOKENS = 4096
 class TextTokenizerTransform(Augmentor):
     def __init__(self, input_keys: list, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
         super().__init__(input_keys, output_keys, args)
+        assert self.output_keys is not None and len(self.output_keys) > 0
 
-        tokenizer_config = self.args["tokenizer_config"]
-        self.cfg_dropout_rate = self.args["cfg_dropout_rate"]
-        self.use_system_prompt = self.args.get("use_system_prompt", False)
+        args = self.args or {}
+        tokenizer_config = args["tokenizer_config"]
+        self.cfg_dropout_rate = args["cfg_dropout_rate"]
+        self.use_system_prompt = args.get("use_system_prompt", False)
+        self.add_camera_tokens = args.get("add_camera_tokens", False)
 
-        self._processor = lazy_instantiate(tokenizer_config)
+        self._processor: Any = lazy_instantiate(tokenizer_config)
+        _, self.special_token_ids = add_special_tokens(
+            self._processor.tokenizer,
+            add_camera_tokens=self.add_camera_tokens,
+        )
 
     def __call__(self, data_dict: dict) -> dict:
         input_caption = data_dict[self.input_keys[0]]
@@ -69,13 +77,15 @@ class TextTokenizerTransformForEditing(Augmentor):
 
     def __init__(self, input_keys: list, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
         super().__init__(input_keys, output_keys, args)
+        assert self.output_keys is not None and len(self.output_keys) > 0
 
-        tokenizer_config = self.args["tokenizer_config"]
-        self.cfg_dropout_rate = self.args.get("cfg_dropout_rate", 0.0)
-        task = self.args.get("task", "editing")
+        args = self.args or {}
+        tokenizer_config = args["tokenizer_config"]
+        self.cfg_dropout_rate = args.get("cfg_dropout_rate", 0.0)
+        task = args.get("task", "editing")
         self._system_prompt = _SYSTEM_PROMPTS.get(task, _SYSTEM_PROMPTS["editing"])
 
-        self._processor = lazy_instantiate(tokenizer_config)
+        self._processor: Any = lazy_instantiate(tokenizer_config)
 
     def __call__(self, data_dict: dict) -> dict | None:
         input_caption = data_dict.get(self.input_keys[0], "")

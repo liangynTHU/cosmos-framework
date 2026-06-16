@@ -61,6 +61,49 @@ from cosmos_framework.utils.vfm.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.vfm.parallelism import ParallelDims
 
 
+class ExtendedTokenEmbedding(torch.nn.Module):
+    """Input embedding wrapper that keeps checkpoint-compatible base weights.
+
+    ``weight`` intentionally keeps the original parameter name and shape so old
+    checkpoints can load ``model.embed_tokens.weight`` unchanged. New tokenizer
+    IDs are handled by a small trainable ``extra_weight`` table.
+    """
+
+    def __init__(self, base_embedding: torch.nn.Embedding, new_vocab_size: int) -> None:
+        super().__init__()
+        old_vocab_size, hidden_size = base_embedding.weight.shape
+        if new_vocab_size <= old_vocab_size:
+            raise ValueError(f"new_vocab_size must exceed old vocab size: {new_vocab_size} <= {old_vocab_size}")
+        self.weight = base_embedding.weight
+        self.extra_weight = torch.nn.Parameter(
+            torch.empty(
+                new_vocab_size - old_vocab_size,
+                hidden_size,
+                device=base_embedding.weight.device,
+                dtype=base_embedding.weight.dtype,
+            )
+        )
+        self.num_embeddings = old_vocab_size
+        self.total_num_embeddings = new_vocab_size
+        self.embedding_dim = hidden_size
+        self.padding_idx = getattr(base_embedding, "padding_idx", None)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        extra_mask = input_ids >= self.num_embeddings
+        safe_input_ids = input_ids.masked_fill(extra_mask, 0)
+        output = torch.nn.functional.embedding(safe_input_ids, self.weight, padding_idx=self.padding_idx)
+        if extra_mask.any():
+            extra_ids = input_ids[extra_mask] - self.num_embeddings
+            output[extra_mask] = torch.nn.functional.embedding(extra_ids, self.extra_weight)
+        return output
+
+    def init_extra_weights(self) -> None:
+        std = 0.02
+        if self.weight.numel() > 0 and self.weight.device.type != "meta":
+            std = float(self.weight.detach().float().std().clamp_min(1e-6).item())
+        torch.nn.init.normal_(self.extra_weight, mean=0.0, std=std)
+
+
 class OmniMoTModel(ImaginaireModel):
     """
     Mixture of Transformers (MoT) model to be trained with the flow matching objective
@@ -142,7 +185,10 @@ class OmniMoTModel(ImaginaireModel):
         self.vlm_processor: Any = lazy_instantiate(self.vlm_config.tokenizer)
 
         vlm_tokenizer = self.vlm_processor.tokenizer
-        vlm_tokenizer, special_tokens = add_special_tokens(vlm_tokenizer)
+        vlm_tokenizer, special_tokens = add_special_tokens(
+            vlm_tokenizer,
+            add_camera_tokens=self.config.use_camera_special_tokens,
+        )
         self.vlm_tokenizer = vlm_tokenizer
 
         self.llm_special_tokens = special_tokens
@@ -170,15 +216,51 @@ class OmniMoTModel(ImaginaireModel):
         else:
             self.tokenizer_sound_gen = None
 
+    def _wrap_language_model_token_embeddings_if_needed(self, language_model: torch.nn.Module) -> None:
+        """Add trainable embeddings for optional tokenizer input-only tokens.
 
+<<<<<<< ours
+=======
+        Camera markers are prompt-side labels; the model does not need to predict
+        them as output tokens. Keeping ``lm_head`` and the base embedding table at
+        their checkpoint shapes lets old Cosmos3-Nano checkpoints load normally,
+        while ``ExtendedTokenEmbedding.extra_weight`` learns only the new camera
+        marker rows.
+        """
+        if not self.config.use_camera_special_tokens:
+            return
+
+        tokenizer_vocab_size = len(self.vlm_tokenizer)
+        input_embeddings = language_model.get_input_embeddings()
+        old_vocab_size = input_embeddings.weight.shape[0]
+        if tokenizer_vocab_size <= old_vocab_size or isinstance(input_embeddings, ExtendedTokenEmbedding):
+            return
+
+        language_model.set_input_embeddings(ExtendedTokenEmbedding(input_embeddings, tokenizer_vocab_size))
+        log.info(
+            f"Added input-only camera token embeddings for tokenizer vocab: "
+            f"{old_vocab_size} -> {tokenizer_vocab_size}"
+        )
+
+    def _init_extended_token_embeddings(self, net: torch.nn.Module) -> None:
+        for module in net.modules():
+            if isinstance(module, ExtendedTokenEmbedding):
+                module.init_extra_weights()
+
+>>>>>>> theirs
     def build_net(self, dtype: torch.dtype):
         # Build model network and parallelize it.
         with torch.device("meta"):
             assert self.vlm_config.model_instance is not None, "Model instance should be specified"
 
             language_model = lazy_instantiate(self.vlm_config.model_instance)
+<<<<<<< ours
 
             # NOTE: We pass "RF timesteps" to the network in the same scale as the scheduler
+=======
+            self._wrap_language_model_token_embeddings_if_needed(language_model)
+
+>>>>>>> theirs
             # (i.e., roughly [0, num_train_timesteps]). The MoT network expects to internally
             # rescale timesteps before embedding; avoid hard-coding 1e-3 by computing it from
             # the configured scheduler resolution.
@@ -247,6 +329,7 @@ class OmniMoTModel(ImaginaireModel):
                 # meta), since they are only for checkpoint conversion and smoke
                 # tests.
                 net.init_weights(buffer_device=DEVICE)
+                self._init_extended_token_embeddings(net)
                 if getattr(self.config, "lora_enabled", False):
                     self._init_lora_weights_post_materialization(net)
 
@@ -567,8 +650,10 @@ class OmniMoTModel(ImaginaireModel):
             video_temporal_causal=self.config.video_temporal_causal,
             action_dim=self.config.max_action_dim,
             initial_mrope_temporal_offset=initial_mrope_temporal_offset,
+            fastwam_action_only=self._is_fastwam_action_only_enabled(),
         )
 
+<<<<<<< ours
     def _get_temporal_positions_vision(
         self,
         raw_state_vision: list[torch.Tensor],
@@ -620,6 +705,22 @@ class OmniMoTModel(ImaginaireModel):
             )  # [T_latent]
             temporal_positions_vision.append(temporal_positions)
         return temporal_positions_vision
+=======
+    def _is_fastwam_action_only_enabled(self) -> bool:
+        """Return True only when the explicit FastWAM action-only mode is enabled."""
+        fastwam_cfg = getattr(self.config, "fastwam_action_only", None)
+        if isinstance(fastwam_cfg, dict):
+            cfg_enabled = bool(fastwam_cfg.get("enabled", False))
+        else:
+            cfg_enabled = bool(getattr(fastwam_cfg, "enabled", False)) if fastwam_cfg is not None else False
+        return getattr(self.config, "wam_mode", "cosmos_default") == "fastwam_action_only" or cfg_enabled
+
+    def _fastwam_cfg_value(self, key: str, default=None):
+        fastwam_cfg = getattr(self.config, "fastwam_action_only", None)
+        if isinstance(fastwam_cfg, dict):
+            return fastwam_cfg.get(key, default)
+        return getattr(fastwam_cfg, key, default) if fastwam_cfg is not None else default
+>>>>>>> theirs
 
     # ------------------------ training ------------------------
 
@@ -965,6 +1066,38 @@ class OmniMoTModel(ImaginaireModel):
         if getattr(rf_cfg, "independent_sound_schedule", False) and sigmas_sound is not None:
             output_batch["sigma_sound"] = sigmas_sound  # [n_sound, 1] — dense over sound-bearing samples
 
+        if self._is_fastwam_action_only_enabled():
+            output_batch.update(
+                loss=loss.detach(),
+                fastwam_mode=torch.tensor(True, device=loss.device),
+                num_action_tokens=torch.tensor(_action_tokens, device=loss.device, dtype=torch.long),
+                num_future_video_tokens=torch.tensor(
+                    int(packed_sequence.vision.mse_loss_indexes.numel()) if packed_sequence.vision is not None else 0,
+                    device=loss.device,
+                    dtype=torch.long,
+                ),
+                action_norm_mean=(
+                    torch.stack([a.float().mean() for a in gen_data_clean.x0_tokens_action]).mean()
+                    if gen_data_clean.x0_tokens_action
+                    else torch.tensor(0.0, device=loss.device)
+                ),
+                action_norm_std=(
+                    torch.stack([a.float().std() for a in gen_data_clean.x0_tokens_action]).mean()
+                    if gen_data_clean.x0_tokens_action
+                    else torch.tensor(0.0, device=loss.device)
+                ),
+                pred_action_norm_mean=(
+                    torch.stack([a.float().mean() for a in out_net.get("preds_action", [])]).mean()
+                    if out_net.get("preds_action")
+                    else torch.tensor(0.0, device=loss.device)
+                ),
+                pred_action_norm_std=(
+                    torch.stack([a.float().std() for a in out_net.get("preds_action", [])]).mean()
+                    if out_net.get("preds_action")
+                    else torch.tensor(0.0, device=loss.device)
+                ),
+            )
+
         return output_batch, loss
 
     def _compute_flow_matching_loss(
@@ -1048,6 +1181,11 @@ class OmniMoTModel(ImaginaireModel):
 
         rf_cfg = self.config.rectified_flow_training_config
         normalize_by_active = rf_cfg.normalize_loss_by_active
+        fastwam_enabled = self._is_fastwam_action_only_enabled()
+        fastwam_use_video_aux = bool(self._fastwam_cfg_value("use_video_aux_loss", True))
+        fastwam_use_action = bool(self._fastwam_cfg_value("use_action_loss", True))
+        fastwam_video_aux_weight = float(self._fastwam_cfg_value("video_aux_loss_weight", 1.0))
+        fastwam_action_weight = float(self._fastwam_cfg_value("action_loss_weight", 1.0))
         if self.config.vision_gen:
             assert data_batch_packed.vision is not None, "Vision packed data required when vision_gen is True"
             assert isinstance(data_batch_packed.vision.condition_mask, list), (
@@ -1067,9 +1205,14 @@ class OmniMoTModel(ImaginaireModel):
             loss_scale = (
                 rf_cfg.image_loss_scale if is_image_batch and rf_cfg.image_loss_scale is not None else rf_cfg.loss_scale
             )
+            if fastwam_enabled:
+                loss_scale = fastwam_video_aux_weight if fastwam_use_video_aux else 0.0
             total_loss += fm_loss_vision * loss_scale
             losses_dict["flow_matching_loss_vision"] = fm_loss_vision
             losses_dict["flow_matching_loss_vision_per_instance"] = fm_loss_vision_per_instance
+            if fastwam_enabled:
+                losses_dict["loss_video_aux"] = fm_loss_vision * loss_scale
+                losses_dict["video_aux_mse"] = fm_loss_vision
         else:
             losses_dict["flow_matching_loss_vision"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
 
@@ -1091,8 +1234,14 @@ class OmniMoTModel(ImaginaireModel):
                 )
 
                 # Yihuai: In case the video loss is too large (1.5) and covers the action loss (0.05), we scale up the action loss to match the video loss to improve action precision.
-                total_loss += fm_loss_action * rf_cfg.action_loss_weight
+                action_loss_scale = fastwam_action_weight if fastwam_enabled else rf_cfg.action_loss_weight
+                if fastwam_enabled and not fastwam_use_action:
+                    action_loss_scale = 0.0
+                total_loss += fm_loss_action * action_loss_scale
                 losses_dict["flow_matching_loss_action"] = fm_loss_action
+                if fastwam_enabled:
+                    losses_dict["loss_action"] = fm_loss_action * action_loss_scale
+                    losses_dict["action_mse"] = fm_loss_action
             else:
                 # No action data in this batch. Connect the network's dummy preds_action
                 # to the loss so action-specific params
@@ -1540,11 +1689,17 @@ class OmniMoTModel(ImaginaireModel):
                 # view(-1,1)[:T_i]: for base/TF sigmas[i] is (1,) → (1,1), slice is a no-op;
                 # for DF sigmas[i] is (T_max,) → (T_max,1) → (T_i,1) per-action-timestep sigmas.
                 # condition_mask[i] shape [T_i,1]; result broadcasts with x0 shape [T_i,C].
-                sigmas_action = [
-                    sigmas_for_action[i].view(-1, 1)[: x0_action[i].shape[0]]
-                    * (1.0 - packed_sequence.action.condition_mask[i])
-                    for i in range(action_batch_size)
-                ]  # list of [T_i,1]
+                sigmas_action = []
+                for i in range(action_batch_size):
+                    sigma_i = sigmas_for_action[i].view(-1, 1)
+                    action_t = x0_action[i].shape[0]
+                    if sigma_i.shape[0] != action_t:
+                        if action_t % sigma_i.shape[0] != 0:
+                            raise ValueError(
+                                f"Cannot align action sigma length {sigma_i.shape[0]} to action length {action_t}"
+                            )
+                        sigma_i = sigma_i.repeat_interleave(action_t // sigma_i.shape[0], dim=0)
+                    sigmas_action.append(sigma_i[:action_t] * (1.0 - packed_sequence.action.condition_mask[i]))
                 assert sigmas_action is not None
                 xt_action, vt_action = self.rectified_flow_action.get_interpolation(
                     epsilon_action, x0_action, sigmas_action
@@ -2790,6 +2945,114 @@ class OmniMoTModel(ImaginaireModel):
         )
 
     @torch.no_grad()
+    def predict_action_fastwam(
+        self,
+        obs_images: torch.Tensor | list[torch.Tensor],
+        instruction: str | list[str],
+        action_horizon: int | None = None,
+        action_denoising_steps: int | None = None,
+        return_debug: bool = False,
+        seed: int | list[int] = 1,
+        domain_id: int = 0,
+        raw_action_dim: int | None = None,
+    ) -> dict:
+        """FastWAM-style action-only inference.
+
+        This path never constructs future-video targets, never decodes video, and
+        returns only the sampled action chunk plus optional debug metadata.
+        """
+        if not self._is_fastwam_action_only_enabled():
+            raise ValueError("predict_action_fastwam requires wam_mode='fastwam_action_only' or fastwam_action_only.enabled=true")
+        if self._fastwam_cfg_value("disable_video_decode_at_inference", True) is not True:
+            raise ValueError("FastWAM action-only inference requires disable_video_decode_at_inference=true")
+
+        prompts = [instruction] if isinstance(instruction, str) else list(instruction)
+        images = obs_images if isinstance(obs_images, list) else [obs_images]
+        if len(prompts) != len(images):
+            raise ValueError(f"instruction count {len(prompts)} must match obs_images count {len(images)}")
+
+        resolved_horizon = int(action_horizon or self._fastwam_cfg_value("action_horizon", 16))
+        steps = int(action_denoising_steps or self._fastwam_cfg_value("action_denoising_steps", None) or 35)
+        max_action_dim = int(getattr(self.config, "max_action_dim", self._fastwam_cfg_value("action_dim", 32) or 32))
+        raw_dim = int(raw_action_dim or self._fastwam_cfg_value("action_dim", None) or max_action_dim)
+        raw_dim = min(raw_dim, max_action_dim)
+
+        video_batch: list[torch.Tensor] = []
+        for img in images:
+            if img.ndim == 3:
+                img = img.unsqueeze(1)  # [C,H,W] -> [C,1,H,W]
+            elif img.ndim == 4:
+                pass
+            elif img.ndim == 5 and img.shape[0] == 1:
+                img = img.squeeze(0)
+            else:
+                raise ValueError(f"obs_images item must be [C,H,W], [C,T,H,W], or [1,C,T,H,W], got {tuple(img.shape)}")
+            img = img[:, :1].contiguous()
+            if torch.is_floating_point(img):
+                img = img.unsqueeze(0)
+            video_batch.append(img)
+
+        batch_size = len(video_batch)
+        seeds = [seed + i for i in range(batch_size)] if isinstance(seed, int) else list(seed)
+        if len(seeds) != batch_size:
+            raise ValueError(f"seed count {len(seeds)} must match batch size {batch_size}")
+
+        action_dtype = torch.float32
+        dummy_actions = [torch.zeros(resolved_horizon, max_action_dim, dtype=action_dtype) for _ in range(batch_size)]
+        sequence_plans = [
+            SequencePlan(
+                has_text=True,
+                has_vision=True,
+                has_action=True,
+                condition_frame_indexes_vision=[0],
+                condition_frame_indexes_action=[],
+                fastwam_action_only=True,
+            )
+            for _ in range(batch_size)
+        ]
+        data_batch = {
+            self.input_video_key: video_batch,
+            self.input_caption_key: prompts,
+            "ai_caption": prompts,
+            "action": dummy_actions,
+            "domain_id": [torch.tensor(domain_id, dtype=torch.long) for _ in range(batch_size)],
+            "raw_action_dim": [torch.tensor(raw_dim, dtype=torch.long) for _ in range(batch_size)],
+            "conditioning_fps": torch.full((batch_size,), float(self._fastwam_cfg_value("control_fps", 15))),
+            "sequence_plan": sequence_plans,
+            "is_preprocessed": torch.is_floating_point(video_batch[0]),
+        }
+
+        result = self.generate_samples_from_batch(
+            data_batch=data_batch,
+            seed=seeds,
+            num_steps=steps,
+            guidance=1.0,
+            has_negative_prompt=False,
+        )
+        actions = result.get("action")
+        if not actions:
+            raise RuntimeError("FastWAM action-only inference did not return action latents.")
+        execute_horizon = self._fastwam_cfg_value("execute_horizon", None)
+        if execute_horizon is not None:
+            actions = [a[: int(execute_horizon)] for a in actions]
+        denorm_actions = [a[:, :raw_dim].detach().float().cpu() for a in actions]
+        output = {
+            "actions": denorm_actions[0] if len(denorm_actions) == 1 else denorm_actions,
+            "normalized_actions": denorm_actions[0] if len(denorm_actions) == 1 else denorm_actions,
+            "debug": {
+                "num_video_tokens": 0,
+                "num_future_video_tokens": 0,
+                "num_action_tokens": int(denorm_actions[0].shape[0]) if denorm_actions else 0,
+                "used_video_decode": False,
+                "output_action_only": True,
+                "action_denoising_steps": steps,
+            },
+        }
+        if return_debug:
+            return output
+        return {"actions": output["actions"]}
+
+    @torch.no_grad()
     def validation_step(self, data_batch: dict[str, torch.Tensor], iteration: int):
         pass
 
@@ -2828,7 +3091,20 @@ class OmniMoTModel(ImaginaireModel):
             # if has_multiple_vision_per_sample, this means that the input media is a list of lists of tensors, we need to flatten it to a list of tensors
             if has_multiple_vision_per_sample:
                 media_key = self.input_video_key if not is_image_batch else self.input_image_key
-                data_batch[media_key] = [item.unsqueeze(0) for sublist in sample_vision_list for item in sublist]
+                flattened_media = []
+                for sublist in sample_vision_list:
+                    for item in sublist:
+                        if item.ndim == 4:
+                            item = item.unsqueeze(0)
+                        elif item.ndim != 5:
+                            raise ValueError(
+                                f"Expected multi-vision item shape [C, T, H, W] or [B, C, T, H, W], got {tuple(item.shape)}"
+                            )
+                        flattened_media.append(item)
+                data_batch[media_key] = flattened_media
+                image_size = data_batch.get("image_size")
+                if isinstance(image_size, list) and image_size and isinstance(image_size[0], (list, tuple)):
+                    data_batch["image_size"] = [item for sublist in image_size for item in sublist]
                 if data_batch[media_key][0].dtype == torch.float32 and not is_image_batch:
                     data_batch["is_preprocessed"] = (
                         True  # for video batch, is_processed = True means the video data is normalized. However, for the image batch, is_processed = True means the image data is augmented with a temporal dimension.
@@ -2977,9 +3253,18 @@ class OmniMoTModel(ImaginaireModel):
                 for i in range(len(data_batch[input_key])):
                     item = data_batch[input_key][i]
                     if isinstance(item, torch.Tensor):
-                        item = [item]
-                    assert item[0].dtype == torch.uint8, "Video data is not in uint8 format."
-                    data_batch[input_key][i] = torch.stack(item).to(**self.tensor_kwargs) / 127.5 - 1.0
+                        assert item.dtype == torch.uint8, "Video data is not in uint8 format."
+                        if item.ndim == 4:
+                            item = item.unsqueeze(0)
+                        elif item.ndim != 5:
+                            raise ValueError(f"Expected video shape [C, T, H, W] or [B, C, T, H, W], got {tuple(item.shape)}")
+                        data_batch[input_key][i] = item.to(**self.tensor_kwargs) / 127.5 - 1.0
+                    else:
+                        assert item[0].dtype == torch.uint8, "Video data is not in uint8 format."
+                        if item[0].ndim == 5 and len(item) == 1:
+                            data_batch[input_key][i] = item[0].to(**self.tensor_kwargs) / 127.5 - 1.0
+                        else:
+                            data_batch[input_key][i] = torch.stack(item).to(**self.tensor_kwargs) / 127.5 - 1.0
                 data_batch[IS_PREPROCESSED_KEY] = True
 
     def _normalize_action_databatch(

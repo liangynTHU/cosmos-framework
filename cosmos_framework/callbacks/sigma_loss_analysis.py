@@ -4,8 +4,6 @@
 from dataclasses import dataclass
 from typing import Optional
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -110,6 +108,9 @@ class SigmaLossAnalysis(Callback):
     ) -> Optional[wandb.Image]:
         if len(sigma_arr) == 0:
             return None
+
+        import matplotlib
+        import matplotlib.pyplot as plt
 
         # Convert to numpy for plotting
         sigma_np = sigma_arr.cpu().float().numpy()

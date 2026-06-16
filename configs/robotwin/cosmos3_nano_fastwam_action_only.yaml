@@ -1,0 +1,48 @@
+base: examples/toml/sft_config/robotwin_lerobot_action_sft_nano.toml
+
+model:
+  name: "Cosmos3-Nano"
+  wam_mode: "fastwam_action_only"
+  joint_attn_implementation: "flex"
+
+fastwam_action_only:
+  enabled: true
+  obs_frames: 1
+  future_video_frames: 16
+  action_horizon: 16
+  action_loss_weight: 1.0
+  video_aux_loss_weight: 1.0
+  use_video_aux_loss: true
+  use_action_loss: true
+  disable_future_video_tokens_at_inference: true
+  disable_video_decode_at_inference: true
+  save_debug_video: false
+  strict_no_future_video_to_action: true
+  assert_attention_mask: true
+  assert_no_video_decode_in_inference: true
+  allow_lambda_video_zero: true
+
+data:
+  dataset: "robotwin"
+  use_action: true
+  use_future_video: true
+  normalize_action: true
+
+train:
+  log_keys:
+    - loss
+    - loss_action
+    - loss_video_aux
+    - action_mse
+    - video_aux_mse
+    - action_norm_mean
+    - action_norm_std
+    - pred_action_norm_mean
+    - pred_action_norm_std
+    - num_action_tokens
+    - num_future_video_tokens
+    - fastwam_mode
+
+eval:
+  output_action_only: true
+  save_generated_video: false

@@ -1387,6 +1387,24 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             self.model.model.clear_decoder_cache()
             self._keep_decoder_cache = False
 
+    def _pad_temporal_to_valid_length(self, state: torch.Tensor) -> torch.Tensor:
+        """Pad temporal length to the Wan VAE requirement: ``T == 1`` or ``T = 4n + 1``.
+
+        Short robotics clips can have arbitrary temporal lengths such as ``T=3``.
+        Repeating the last frame avoids introducing artificial zero/gray frames.
+        """
+        if state.ndim != 5:
+            raise ValueError(f"Expected state shape [B, C, T, H, W], got {tuple(state.shape)}")
+
+        temporal_len = state.shape[2]
+        if temporal_len == 1 or (temporal_len - 1) % self._temporal_compression_factor == 0:
+            return state
+
+        target_temporal_len = self.get_pixel_num_frames(self.get_latent_num_frames(temporal_len))
+        pad_frames = target_temporal_len - temporal_len
+        last_frame = state[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+        return torch.cat([state, last_frame], dim=2)
+
     def encode(self, state: torch.Tensor) -> torch.Tensor:
         """Encode a batch of videos.
 
@@ -1394,8 +1412,9 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             state: Tensor of shape ``[B, C, T, H, W]``.
 
         Returns:
-            Tensor of shape ``[B, z_dim, T//4, H//16, W//16]``.
+            Tensor of shape ``[B, z_dim, ceil((T - 1) / 4) + 1, H//16, W//16]``.
         """
+        state = self._pad_temporal_to_valid_length(state)
         return self.model.encode(state)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
@@ -1651,10 +1670,12 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             raise RuntimeError("AOT compilation produced no loadable functions")
 
     def get_latent_num_frames(self, num_pixel_frames: int) -> int:
-        return 1 + (num_pixel_frames - 1) // 4
+        if num_pixel_frames <= 1:
+            return 1
+        return 1 + (num_pixel_frames - 2) // self._temporal_compression_factor + 1
 
     def get_pixel_num_frames(self, num_latent_frames: int) -> int:
-        return (num_latent_frames - 1) * 4 + 1
+        return (num_latent_frames - 1) * self._temporal_compression_factor + 1
 
     @property
     def spatial_compression_factor(self) -> int:
