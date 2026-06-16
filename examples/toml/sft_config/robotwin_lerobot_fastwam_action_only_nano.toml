@@ -43,7 +43,7 @@ rate            = 0.1
 iteration_shift = 0
 
 [model.parallelism]
-data_parallel_shard_degree     = -1
+data_parallel_shard_degree     = 8
 data_parallel_replicate_degree = 1
 context_parallel_shard_degree  = 1
 cfg_parallel_shard_degree      = 1
@@ -66,42 +66,51 @@ action_loss_weight = 1.0
 loss_scale         = 1.0
 
 [optimizer]
-betas          = [0.9, 0.95]
-eps            = 1.0e-6
+betas          = [0.9, 0.99]
+eps            = 1.0e-8
 fused          = true
-keys_to_select = ["moe_gen", "time_embedder", "vae2llm", "llm2vae", "action"]
-lr             = 2.0e-5
-weight_decay   = 0
+keys_to_select = ["moe_gen", "time_embedder", "vae2llm", "llm2vae", "action2llm", "llm2action", "action_modality_embed"]
+lr             = 2.0e-4
+optimizer_type = "FusedAdam"
+weight_decay   = 0.05
 
 [optimizer.lr_multipliers]
+action2llm            = 5.0
+llm2action            = 5.0
 action_modality_embed = 5.0
 
 [scheduler]
-cycle_lengths      = [10]
-f_max              = [1.0]
+cycle_lengths      = [10000]
+f_max              = [0.4]
 f_min              = [0.0]
 f_start            = [0.0]
 verbosity_interval = 0
-warm_up_steps      = [1]
+warm_up_steps      = [0]
 
 [trainer]
 distributed_parallelism = "fsdp"
 grad_accum_iter         = 1
-logging_iter            = 1
-max_iter                = 5
+logging_iter            = 50
+max_iter                = 10000
 
 [trainer.callbacks.compile_tokenizer]
 compile_after_iterations = 3
 enabled                  = false
 
 [trainer.callbacks.grad_clip]
-clip_norm    = 0.1
+clip_norm    = 1.0
 force_finite = true
 
 [checkpoint]
-keys_to_skip_loading = ["net_ema."]
+keys_to_skip_loading = ["net_ema.", "action2llm", "llm2action", "action_modality_embed", "action_pos_embed"]
 load_path            = "${oc.env:BASE_CHECKPOINT_PATH}"
-save_iter            = 1000000
+save_iter            = 1000
+strict_resume        = false
 
 [dataloader_train]
-max_samples_per_batch = 1
+max_samples_per_batch = 128
+
+[dataloader_train.dataloader.datasets.robotwin.dataset]
+wam_mode            = "fastwam_action_only"
+future_video_frames = 16
+action_horizon      = 16
