@@ -404,6 +404,13 @@ class OptimizerConfig(BaseModel):
             "different numerical behavior vs. the foreach implementation."
         ),
     )
+    optimizer_type: str = Field(
+        default="FusedAdam",
+        description=(
+            "Optimizer implementation name forwarded to the Hydra optimizer "
+            "config. VFM action recipes commonly use 'FusedAdam'."
+        ),
+    )
     keys_to_select: list[str] = Field(
         default_factory=list,
         description=(
@@ -607,6 +614,13 @@ class CheckpointConfig(BaseModel):
         default=100,
         description="Save a new checkpoint every N optimizer steps.",
     )
+    strict_resume: bool = Field(
+        default=True,
+        description=(
+            "Load checkpoint tensors strictly. Set false when warm-starting "
+            "from a base checkpoint with newly initialized action modules."
+        ),
+    )
 
 
 # ---------------------------------------------------------------- dataloader_train
@@ -650,6 +664,13 @@ class DataloaderTrainConfig(BaseModel):
         description=(
             "Dataloader RNG seed. Skipped on VLM (CosmosDataLoader has "
             "no seed ctor kwarg there)."
+        ),
+    )
+    dataloader: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Optional passthrough overrides for the experiment-defined "
+            "dataloader LazyCall tree, such as datasets.robotwin.dataset.*."
         ),
     )
 

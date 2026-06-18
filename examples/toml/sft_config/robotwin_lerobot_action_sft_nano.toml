@@ -82,3 +82,7 @@ strict_resume        = false
 
 [dataloader_train]
 max_samples_per_batch = 128
+
+[dataloader_train.dataloader.datasets.robotwin.dataset]
+use_state = true
+state_key = "observation.state"

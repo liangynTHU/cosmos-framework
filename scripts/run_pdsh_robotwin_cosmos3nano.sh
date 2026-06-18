@@ -53,7 +53,7 @@ Required or auto-filled:
   MASTER_ADDR                  Rank-0 node address. Defaults to first node.
 
 Common environment variables:
-  COSMOS_WORKDIR               Repo path on every node, default /mnt/lyn/workspace/cosmos3/cosmos-framework.
+  COSMOS_WORKDIR               Repo path on every node, default /mnt/lyn/workspace/wam.
   CONDA_SH                     Conda profile script.
   CONDA_ENV                    Conda env name, default cosmos3.
   TRAINING_NAME                Required run directory name under OUTPUT_BASE_ROOT.
@@ -71,8 +71,16 @@ Common environment variables:
   WANDB_API_KEY_FILE           W&B API key file when WANDB_API_KEY is unset.
   MAX_ITER/SAVE_ITER           Training length and checkpoint interval.
   MAX_EPISODES                 Dataset episode limit. Unset means use all data if supported.
+  ROBOTWIN_TASK_INDEX          Optional RoboTwin task_index filter. Keeps all episodes from this task.
+  ROBOTWIN_TASK_NAME           Optional RoboTwin task name filter. Must match meta/tasks.jsonl exactly.
+  ROBOTWIN_DATASET_REPEAT      Repeat filtered dataset length, default 1. Useful for one-task overfit.
+  ROBOTWIN_USE_STATE           Whether to prepend qpos/proprio state as the first action row, default true.
+  ROBOTWIN_STATE_KEY           qpos/proprio parquet field, default observation.state.
   OBSERVATION_IMAGE_MODE       concat or multi_image. concat keeps the legacy single concatenated observation.
   ROBOTWIN_VIEWPOINT           Optional dataset viewpoint override. Set to concat_view for the three-camera baseline.
+  OPTIMIZER_LR                 Optional optimizer base lr override.
+  SCHEDULER_F_MAX/F_MIN        Optional scheduler multiplier overrides.
+  SCHEDULER_WARM_UP_STEPS      Optional scheduler warm-up override.
 
 Any positional args are passed as extra OmegaConf overrides after the defaults.
 USAGE
@@ -86,7 +94,7 @@ fi
 SCRIPT_ARGS=("$@")
 SCRIPT_ARGS_STR="${SCRIPT_ARGS[*]}"
 
-COSMOS_WORKDIR="${COSMOS_WORKDIR:-/mnt/lyn/workspace/cosmos3/cosmos-framework}"
+COSMOS_WORKDIR="${COSMOS_WORKDIR:-/mnt/lyn/workspace/wam}"
 CONDA_SH="${CONDA_SH:-/jizhicfs/peterrao/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-cosmos3}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/run_train_robotwin_cosmos3nano.sh}"
@@ -221,8 +229,44 @@ for i in "${!IP_ARRAY[@]}"; do
         REMOTE_ENV_ARGS+=("MAX_EPISODES=$MAX_EPISODES")
     fi
 
+    if [[ -n "${ROBOTWIN_TASK_INDEX:-}" ]]; then
+        REMOTE_ENV_ARGS+=("ROBOTWIN_TASK_INDEX=$ROBOTWIN_TASK_INDEX")
+    fi
+
+    if [[ -n "${ROBOTWIN_TASK_NAME:-}" ]]; then
+        REMOTE_ENV_ARGS+=("ROBOTWIN_TASK_NAME=$ROBOTWIN_TASK_NAME")
+    fi
+
+    if [[ -n "${ROBOTWIN_DATASET_REPEAT:-}" ]]; then
+        REMOTE_ENV_ARGS+=("ROBOTWIN_DATASET_REPEAT=$ROBOTWIN_DATASET_REPEAT")
+    fi
+
+    if [[ -n "${ROBOTWIN_USE_STATE:-}" ]]; then
+        REMOTE_ENV_ARGS+=("ROBOTWIN_USE_STATE=$ROBOTWIN_USE_STATE")
+    fi
+
+    if [[ -n "${ROBOTWIN_STATE_KEY:-}" ]]; then
+        REMOTE_ENV_ARGS+=("ROBOTWIN_STATE_KEY=$ROBOTWIN_STATE_KEY")
+    fi
+
     if [[ -n "${ROBOTWIN_VIEWPOINT:-}" ]]; then
         REMOTE_ENV_ARGS+=("ROBOTWIN_VIEWPOINT=$ROBOTWIN_VIEWPOINT")
+    fi
+
+    if [[ -n "${OPTIMIZER_LR:-}" ]]; then
+        REMOTE_ENV_ARGS+=("OPTIMIZER_LR=$OPTIMIZER_LR")
+    fi
+
+    if [[ -n "${SCHEDULER_F_MAX:-}" ]]; then
+        REMOTE_ENV_ARGS+=("SCHEDULER_F_MAX=$SCHEDULER_F_MAX")
+    fi
+
+    if [[ -n "${SCHEDULER_F_MIN:-}" ]]; then
+        REMOTE_ENV_ARGS+=("SCHEDULER_F_MIN=$SCHEDULER_F_MIN")
+    fi
+
+    if [[ -n "${SCHEDULER_WARM_UP_STEPS:-}" ]]; then
+        REMOTE_ENV_ARGS+=("SCHEDULER_WARM_UP_STEPS=$SCHEDULER_WARM_UP_STEPS")
     fi
 
     if [[ -n "${WANDB_API_KEY:-}" ]]; then
@@ -246,7 +290,7 @@ for i in "${!IP_ARRAY[@]}"; do
          . $(printf '%q' "$CONDA_SH"); \
          conda activate $(printf '%q' "$CONDA_ENV"); \
          ${REMOTE_EXPORTS} \
-         echo \"REMOTE CHECK: NODE_RANK=\$NODE_RANK NNODES=\$NNODES MASTER_ADDR=\$MASTER_ADDR MASTER_PORT=\$MASTER_PORT NPROC_PER_NODE=\$NPROC_PER_NODE TRAINING_NAME=\$TRAINING_NAME OUTPUT_ROOT=\$OUTPUT_ROOT WANDB_NAME=\$WANDB_NAME WANDB_MODE=\$WANDB_MODE COSMOS_MODELS_ROOT=\$COSMOS_MODELS_ROOT HF_HOME=\$HF_HOME BASE_CHECKPOINT_PATH=\$BASE_CHECKPOINT_PATH WAN_VAE_PATH=\$WAN_VAE_PATH QWEN_TOKENIZER_PATH=\$QWEN_TOKENIZER_PATH NCCL_SOCKET_IFNAME=\$NCCL_SOCKET_IFNAME NCCL_IB_HCA=\$NCCL_IB_HCA\"; \
+         echo \"REMOTE CHECK: NODE_RANK=\$NODE_RANK NNODES=\$NNODES MASTER_ADDR=\$MASTER_ADDR MASTER_PORT=\$MASTER_PORT NPROC_PER_NODE=\$NPROC_PER_NODE TRAINING_NAME=\$TRAINING_NAME OUTPUT_ROOT=\$OUTPUT_ROOT WANDB_NAME=\$WANDB_NAME WANDB_MODE=\$WANDB_MODE ROBOTWIN_TASK_INDEX=\${ROBOTWIN_TASK_INDEX:-} ROBOTWIN_TASK_NAME=\${ROBOTWIN_TASK_NAME:-} ROBOTWIN_DATASET_REPEAT=\${ROBOTWIN_DATASET_REPEAT:-1} ROBOTWIN_USE_STATE=\${ROBOTWIN_USE_STATE:-true} ROBOTWIN_STATE_KEY=\${ROBOTWIN_STATE_KEY:-observation.state} OPTIMIZER_LR=\${OPTIMIZER_LR:-} SCHEDULER_F_MAX=\${SCHEDULER_F_MAX:-} SCHEDULER_F_MIN=\${SCHEDULER_F_MIN:-} SCHEDULER_WARM_UP_STEPS=\${SCHEDULER_WARM_UP_STEPS:-} COSMOS_MODELS_ROOT=\$COSMOS_MODELS_ROOT HF_HOME=\$HF_HOME BASE_CHECKPOINT_PATH=\$BASE_CHECKPOINT_PATH WAN_VAE_PATH=\$WAN_VAE_PATH QWEN_TOKENIZER_PATH=\$QWEN_TOKENIZER_PATH NCCL_SOCKET_IFNAME=\$NCCL_SOCKET_IFNAME NCCL_IB_HCA=\$NCCL_IB_HCA\"; \
          exec bash ${REMOTE_SCRIPT_PATH}${REMOTE_SCRIPT_ARGS_STR}" &
 done
 

@@ -219,8 +219,6 @@ class OmniMoTModel(ImaginaireModel):
     def _wrap_language_model_token_embeddings_if_needed(self, language_model: torch.nn.Module) -> None:
         """Add trainable embeddings for optional tokenizer input-only tokens.
 
-<<<<<<< ours
-=======
         Camera markers are prompt-side labels; the model does not need to predict
         them as output tokens. Keeping ``lm_head`` and the base embedding table at
         their checkpoint shapes lets old Cosmos3-Nano checkpoints load normally,
@@ -247,20 +245,15 @@ class OmniMoTModel(ImaginaireModel):
             if isinstance(module, ExtendedTokenEmbedding):
                 module.init_extra_weights()
 
->>>>>>> theirs
     def build_net(self, dtype: torch.dtype):
         # Build model network and parallelize it.
         with torch.device("meta"):
             assert self.vlm_config.model_instance is not None, "Model instance should be specified"
 
             language_model = lazy_instantiate(self.vlm_config.model_instance)
-<<<<<<< ours
-
-            # NOTE: We pass "RF timesteps" to the network in the same scale as the scheduler
-=======
             self._wrap_language_model_token_embeddings_if_needed(language_model)
 
->>>>>>> theirs
+            # NOTE: We pass "RF timesteps" to the network in the same scale as the scheduler
             # (i.e., roughly [0, num_train_timesteps]). The MoT network expects to internally
             # rescale timesteps before embedding; avoid hard-coding 1e-3 by computing it from
             # the configured scheduler resolution.
@@ -653,7 +646,6 @@ class OmniMoTModel(ImaginaireModel):
             fastwam_action_only=self._is_fastwam_action_only_enabled(),
         )
 
-<<<<<<< ours
     def _get_temporal_positions_vision(
         self,
         raw_state_vision: list[torch.Tensor],
@@ -705,7 +697,7 @@ class OmniMoTModel(ImaginaireModel):
             )  # [T_latent]
             temporal_positions_vision.append(temporal_positions)
         return temporal_positions_vision
-=======
+
     def _is_fastwam_action_only_enabled(self) -> bool:
         """Return True only when the explicit FastWAM action-only mode is enabled."""
         fastwam_cfg = getattr(self.config, "fastwam_action_only", None)
@@ -720,7 +712,6 @@ class OmniMoTModel(ImaginaireModel):
         if isinstance(fastwam_cfg, dict):
             return fastwam_cfg.get(key, default)
         return getattr(fastwam_cfg, key, default) if fastwam_cfg is not None else default
->>>>>>> theirs
 
     # ------------------------ training ------------------------
 

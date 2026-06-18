@@ -24,8 +24,17 @@ Environment variables:
   MAX_ITER                  Training iterations override.
   SAVE_ITER                 Checkpoint save interval override.
   MAX_EPISODES              Dataset max episodes override. Set empty or null to use all data if supported.
+  ROBOTWIN_TASK_INDEX       Optional RoboTwin task_index filter. Keeps all episodes from this task.
+  ROBOTWIN_TASK_NAME        Optional RoboTwin task name filter. Must match meta/tasks.jsonl exactly.
+  ROBOTWIN_DATASET_REPEAT   Repeat filtered dataset length, default 1. Useful for one-task overfit.
+  ROBOTWIN_USE_STATE        Whether to prepend qpos/proprio state as the first action row, default true.
+  ROBOTWIN_STATE_KEY        qpos/proprio parquet field, default observation.state.
   OBSERVATION_IMAGE_MODE    concat or multi_image. concat keeps the legacy single concatenated observation.
   ROBOTWIN_VIEWPOINT        Optional dataset viewpoint override. Set to concat_view for the three-camera baseline.
+  OPTIMIZER_LR              Optional optimizer base lr override, e.g. 2.0e-4.
+  SCHEDULER_F_MAX           Optional scheduler f_max override, e.g. 1.0.
+  SCHEDULER_F_MIN           Optional scheduler f_min override, e.g. 1.0 for fixed lr.
+  SCHEDULER_WARM_UP_STEPS   Optional scheduler warm_up_steps override, e.g. 0.
 USAGE
 }
 
@@ -197,24 +206,56 @@ OVERRIDES=(
     "trainer.max_iter=$TRAIN_MAX_ITER"
     "scheduler.cycle_lengths=[$TRAIN_MAX_ITER]"
     "checkpoint.save_iter=${SAVE_ITER:-1000}"
-    "dataloader_train.dataloader.dataset.mode=${ROBOTWIN_MODE:-policy}"
-    "dataloader_train.dataloader.dataset.observation_image_mode=$OBSERVATION_IMAGE_MODE"
+    "dataloader_train.dataloader.datasets.robotwin.dataset.mode=${ROBOTWIN_MODE:-policy}"
+    "dataloader_train.dataloader.datasets.robotwin.dataset.observation_image_mode=$OBSERVATION_IMAGE_MODE"
+    "dataloader_train.dataloader.datasets.robotwin.dataset.use_state=${ROBOTWIN_USE_STATE:-true}"
+    "dataloader_train.dataloader.datasets.robotwin.dataset.state_key=${ROBOTWIN_STATE_KEY:-observation.state}"
     "model.config.use_camera_special_tokens=$USE_CAMERA_SPECIAL_TOKENS"
 )
+
+if [[ -n "${OPTIMIZER_LR:-}" ]]; then
+    OVERRIDES+=("optimizer.lr=$OPTIMIZER_LR")
+fi
+
+if [[ -n "${SCHEDULER_F_MAX:-}" ]]; then
+    OVERRIDES+=("scheduler.f_max=[$SCHEDULER_F_MAX]")
+fi
+
+if [[ -n "${SCHEDULER_F_MIN:-}" ]]; then
+    OVERRIDES+=("scheduler.f_min=[$SCHEDULER_F_MIN]")
+fi
+
+if [[ -n "${SCHEDULER_WARM_UP_STEPS:-}" ]]; then
+    OVERRIDES+=("scheduler.warm_up_steps=[$SCHEDULER_WARM_UP_STEPS]")
+fi
 
 if [[ "$OBSERVATION_IMAGE_MODE" == "multi_image" ]]; then
     OVERRIDES+=("optimizer.keys_to_select=[moe_gen,time_embedder,vae2llm,llm2vae,action,extra_weight]")
 fi
 
 if [[ -n "${MAX_EPISODES+x}" ]]; then
-    OVERRIDES+=("dataloader_train.dataloader.dataset.max_episodes=$MAX_EPISODES")
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.max_episodes=$MAX_EPISODES")
 else
-    OVERRIDES+=("dataloader_train.dataloader.dataset.max_episodes=null")
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.max_episodes=null")
 fi
 
 if [[ -n "${ROBOTWIN_VIEWPOINT:-}" ]]; then
-    OVERRIDES+=("dataloader_train.dataloader.dataset.viewpoint=$ROBOTWIN_VIEWPOINT")
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.viewpoint=$ROBOTWIN_VIEWPOINT")
 fi
+
+if [[ -n "${ROBOTWIN_TASK_INDEX:-}" ]]; then
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_index=$ROBOTWIN_TASK_INDEX")
+else
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_index=null")
+fi
+
+if [[ -n "${ROBOTWIN_TASK_NAME:-}" ]]; then
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_name=$ROBOTWIN_TASK_NAME")
+else
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_name=null")
+fi
+
+OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.dataset_repeat=${ROBOTWIN_DATASET_REPEAT:-1}")
 
 OVERRIDES+=("${EXTRA_OVERRIDES[@]}")
 
@@ -226,20 +267,30 @@ echo "NNODES=$NNODES NODE_RANK=$NODE_RANK NPROC_PER_NODE=$NPROC_PER_NODE"
 echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "DATASET_PATH=$DATASET_PATH"
 echo "OBSERVATION_IMAGE_MODE=$OBSERVATION_IMAGE_MODE"
+echo "ROBOTWIN_TASK_INDEX=${ROBOTWIN_TASK_INDEX:-}"
+echo "ROBOTWIN_TASK_NAME=${ROBOTWIN_TASK_NAME:-}"
+echo "ROBOTWIN_DATASET_REPEAT=${ROBOTWIN_DATASET_REPEAT:-1}"
 echo "USE_CAMERA_SPECIAL_TOKENS=$USE_CAMERA_SPECIAL_TOKENS"
 echo "COSMOS_MODELS_ROOT=$COSMOS_MODELS_ROOT"
 echo "HF_HOME=$HF_HOME"
 echo "BASE_CHECKPOINT_PATH=$BASE_CHECKPOINT_PATH"
 echo "WAN_VAE_PATH=$WAN_VAE_PATH"
 echo "QWEN_TOKENIZER_PATH=$QWEN_TOKENIZER_PATH"
+echo "TOML_FILE=$TOML_FILE"
 echo "TRAINING_NAME=$TRAINING_NAME"
 echo "OUTPUT_BASE_ROOT=$OUTPUT_BASE_ROOT"
 echo "OUTPUT_ROOT=$OUTPUT_ROOT"
 echo "WANDB_PROJECT=$WANDB_PROJECT WANDB_GROUP=$WANDB_GROUP WANDB_NAME=$WANDB_NAME WANDB_MODE=$WANDB_MODE"
+echo "ROBOTWIN_USE_STATE=${ROBOTWIN_USE_STATE:-true}"
+echo "ROBOTWIN_STATE_KEY=${ROBOTWIN_STATE_KEY:-observation.state}"
+echo "OPTIMIZER_LR=${OPTIMIZER_LR:-}"
+echo "SCHEDULER_F_MAX=${SCHEDULER_F_MAX:-}"
+echo "SCHEDULER_F_MIN=${SCHEDULER_F_MIN:-}"
+echo "SCHEDULER_WARM_UP_STEPS=${SCHEDULER_WARM_UP_STEPS:-}"
 echo "LOG_FILE=$LOG_FILE"
 echo "OVERRIDES=${OVERRIDES[*]}"
 
-env | grep -E '^(MASTER|NNODES|NODE_RANK|NPROC_PER_NODE|NCCL|UCX|CUDA|LD_LIBRARY_PATH|PYTORCH_CUDA_ALLOC_CONF|VLLM|WANDB|HF_|HUGGINGFACE|TRANSFORMERS|http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|no_proxy|NO_PROXY|COSMOS_MODELS_ROOT|BASE_CHECKPOINT_PATH|WAN_VAE_PATH|QWEN_TOKENIZER_PATH|TRAINING_NAME|OUTPUT_BASE_ROOT|IMAGINAIRE_OUTPUT_ROOT|OBSERVATION_IMAGE_MODE)=' | sort || true
+env | grep -E '^(MASTER|NNODES|NODE_RANK|NPROC_PER_NODE|NCCL|UCX|CUDA|LD_LIBRARY_PATH|PYTORCH_CUDA_ALLOC_CONF|VLLM|WANDB|HF_|HUGGINGFACE|TRANSFORMERS|http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|no_proxy|NO_PROXY|COSMOS_MODELS_ROOT|BASE_CHECKPOINT_PATH|WAN_VAE_PATH|QWEN_TOKENIZER_PATH|TRAINING_NAME|OUTPUT_BASE_ROOT|IMAGINAIRE_OUTPUT_ROOT|OBSERVATION_IMAGE_MODE|ROBOTWIN_TASK_INDEX|ROBOTWIN_TASK_NAME|ROBOTWIN_DATASET_REPEAT|ROBOTWIN_USE_STATE|ROBOTWIN_STATE_KEY|OPTIMIZER_LR|SCHEDULER_F_MAX|SCHEDULER_F_MIN|SCHEDULER_WARM_UP_STEPS)=' | sort || true
 
 PYTHONPATH=. torchrun \
     --nnodes="$NNODES" \

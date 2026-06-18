@@ -27,11 +27,3 @@ __all__ = [
     "RobotTwinLeRobotDataset",
     "get_robotwin_lerobot_sft_dataset",
 ]
-=======
-from cosmos_framework.data.vfm.action.datasets.robotwin_lerobot_dataset import (
-    RobotTwinLeRobotDataset,
-    get_robotwin_lerobot_sft_dataset,
-)
-
-__all__ = ["DROIDLeRobotDataset", "RobotTwinLeRobotDataset", "get_robotwin_lerobot_sft_dataset"]
->>>>>>> theirs

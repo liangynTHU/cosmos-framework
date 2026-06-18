@@ -23,6 +23,16 @@ from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
 
 _DEFAULT_CAMERA_KEY = "observation.images.cam_high"
 _DEFAULT_WRIST_CAMERA_KEYS = ("observation.images.cam_left_wrist", "observation.images.cam_right_wrist")
+_DEFAULT_STATE_KEY_CANDIDATES = (
+    "observation.state",
+    "observation.qpos",
+    "observation.proprio",
+    "observation.states.qpos",
+    "observation.states.joint.position",
+    "observation.state.joint_positions",
+    "qpos",
+    "proprio",
+)
 _CONCAT_VIEW_DESCRIPTION = (
     "The top row is from the high camera. "
     "The bottom row contains two horizontally concatenated wrist camera views."
@@ -51,7 +61,9 @@ class RobotTwinLeRobotDataset(Dataset):
     14D dual-arm joint/gripper values. It returns samples in the same coarse
     format as the existing action dataset wrappers: ``video`` as uint8
     ``[C, T, H, W]``, ``action`` as float ``[chunk_length, 14]``, caption,
-    fps, mode and domain id.
+    fps, mode and domain id. When ``use_state=True``, the initial 14D
+    ``observation.state`` qpos/proprio vector is prepended to the action sequence,
+    yielding ``[chunk_length + 1, 14]`` with the first row treated as conditioning.
     """
 
     def __init__(
@@ -71,6 +83,11 @@ class RobotTwinLeRobotDataset(Dataset):
         action_horizon: int | None = None,
         caption_prefix: str = "",
         max_episodes: int | None = None,
+        task_index: int | None = None,
+        task_name: str | None = None,
+        dataset_repeat: int = 1,
+        use_state: bool = False,
+        state_key: str | None = None,
     ) -> None:
         super().__init__()
         allowed_modes = (*_MODE_CHOICES, "joint")
@@ -101,13 +118,24 @@ class RobotTwinLeRobotDataset(Dataset):
         self._normalize_action = bool(normalize_action)
         self._caption_prefix = caption_prefix.strip()
         self._max_episodes = max_episodes
+        self._task_index = int(task_index) if task_index is not None else None
+        self._task_name = task_name.strip() if task_name else None
+        self._dataset_repeat = max(1, int(dataset_repeat))
+        self._use_state = bool(use_state)
+        self._state_key = state_key.strip() if state_key else None
         self._domain_id = get_domain_id("robotwin_lerobot")
 
         self._info = json.loads((self._root / "meta" / "info.json").read_text())
         self._fps = float(fps if fps is not None else self._info.get("fps", 50.0))
         self._tasks = self._load_tasks()
+        self._resolved_task_index = self._resolve_task_filter()
         self._episodes = self._load_episode_index()
         self._cumulative_sizes = self._build_cumulative_sizes()
+        if not self._episodes:
+            raise ValueError(
+                "No RoboTwin episodes matched the dataset filters: "
+                f"task_index={self._task_index}, task_name={self._task_name!r}, max_episodes={self._max_episodes}."
+            )
 
     @property
     def fps(self) -> float:
@@ -152,7 +180,8 @@ class RobotTwinLeRobotDataset(Dataset):
         return self._observation_image_mode
 
     def __len__(self) -> int:
-        return self._cumulative_sizes[-1] if self._cumulative_sizes else 0
+        base_len = self._cumulative_sizes[-1] if self._cumulative_sizes else 0
+        return base_len * self._dataset_repeat
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         episode, start_frame = self._locate_index(int(idx))
@@ -171,16 +200,21 @@ class RobotTwinLeRobotDataset(Dataset):
         video = self._load_video(episode, video_rows)
         action_valid_mask = torch.zeros(self._action_horizon, dtype=torch.bool)
         action_values = []
+        action_start_row = 1 if self._use_state else 0
         for step in range(self._action_horizon):
-            row_idx = min(step, len(rows) - 1)
+            row_idx = min(action_start_row + step, len(rows) - 1)
             action_values.append(rows[row_idx]["action"])
-            action_valid_mask[step] = start_frame + step < max_available_frames
+            action_valid_mask[step] = start_frame + action_start_row + step < max_available_frames
         action = torch.tensor(action_values, dtype=torch.float32)
+        if self._use_state:
+            initial_state = self._extract_state(rows[0]).unsqueeze(0)
+            action = torch.cat([initial_state, action], dim=0)
         if self._normalize_action:
             action = action.clamp(-1.0, 1.0)
 
         task = self._tasks[int(rows[0]["task_index"])]
         ai_caption = self._format_caption(task)
+        sample_task_index = int(rows[0]["task_index"])
 
         if isinstance(video, list):
             formatted_video = [
@@ -199,6 +233,7 @@ class RobotTwinLeRobotDataset(Dataset):
             "raw_action_dim": torch.tensor(self.action_dim, dtype=torch.long),
             "camera_key": self._camera_key,
             "episode_index": torch.tensor(int(episode["episode_index"]), dtype=torch.long),
+            "task_index": torch.tensor(sample_task_index, dtype=torch.long),
             "frame_index": torch.tensor(start_frame, dtype=torch.long),
         }
         if self._fastwam_action_only:
@@ -237,45 +272,125 @@ class RobotTwinLeRobotDataset(Dataset):
                 tasks[int(item["task_index"])] = str(item["task"])
         return tasks
 
+    def _extract_state(self, row: dict[str, Any]) -> torch.Tensor:
+        if self._state_key:
+            candidate_keys = (self._state_key,)
+        else:
+            candidate_keys = _DEFAULT_STATE_KEY_CANDIDATES
+        for key in candidate_keys:
+            if key not in row or row[key] is None:
+                continue
+            state = np.asarray(row[key], dtype=np.float32).reshape(-1)
+            if state.size != self.action_dim:
+                raise ValueError(
+                    f"RoboTwin state field {key!r} has dim={state.size}, expected {self.action_dim}. "
+                    "Set dataset.state_key to a 14D qpos/proprio field or disable dataset.use_state."
+                )
+            return torch.from_numpy(state.copy()).float()
+        available = ", ".join(sorted(str(key) for key in row.keys()))
+        expected = ", ".join(candidate_keys)
+        raise KeyError(
+            "RoboTwin use_state=True requires a 14D qpos/proprio field. "
+            f"Tried: {expected}. Available columns: {available}"
+        )
+
+    def _resolve_task_filter(self) -> int | None:
+        if self._task_name is None:
+            return self._task_index
+        matched = [idx for idx, name in self._tasks.items() if name == self._task_name]
+        if not matched:
+            examples = ", ".join(f"{idx}:{name}" for idx, name in sorted(self._tasks.items())[:10])
+            raise ValueError(f"Unknown RoboTwin task_name {self._task_name!r}. Available examples: {examples}")
+        resolved = matched[0]
+        if self._task_index is not None and self._task_index != resolved:
+            raise ValueError(
+                f"RoboTwin task filter mismatch: task_index={self._task_index} but "
+                f"task_name={self._task_name!r} resolves to task_index={resolved}."
+            )
+        return resolved
+
+    def _episode_task_index(self, data_path: Path) -> int:
+        table = pq.ParquetFile(data_path).read_row_group(0, columns=["task_index"])
+        if table.num_rows <= 0:
+            raise ValueError(f"Empty RoboTwin episode parquet: {data_path}")
+        return int(table.column("task_index")[0].as_py())
+
+    def _valid_window_count(self, num_frames: int) -> int:
+        if self._fastwam_action_only:
+            return max(0, int(num_frames))
+        return max(0, int(num_frames) - self._chunk_length)
+
+    def _episode_valid_starts_for_task(self, data_path: Path, num_frames: int) -> np.ndarray:
+        window_count = self._valid_window_count(num_frames)
+        if window_count <= 0:
+            return np.zeros(0, dtype=np.int64)
+        assert self._resolved_task_index is not None
+        resolved_task_index = int(self._resolved_task_index)
+        table = pq.read_table(data_path, columns=["task_index"])
+        task_index = np.asarray(table["task_index"].to_numpy(), dtype=np.int64)
+        return np.flatnonzero(task_index[:window_count] == resolved_task_index).astype(np.int64)
+
     def _load_episode_index(self) -> list[dict[str, Any]]:
         episodes: list[dict[str, Any]] = []
         chunks_size = int(self._info.get("chunks_size", 1000))
         total_episodes = int(self._info["total_episodes"])
-        if self._max_episodes is not None:
-            total_episodes = min(total_episodes, int(self._max_episodes))
+        max_episodes = int(self._max_episodes) if self._max_episodes is not None else None
         for episode_index in range(total_episodes):
             episode_chunk = episode_index // chunks_size
             data_path = self._root / self._info["data_path"].format(
                 episode_chunk=episode_chunk,
                 episode_index=episode_index,
             )
+            num_frames = pq.read_metadata(data_path).num_rows
+            valid_starts: np.ndarray | None = None
+            if self._resolved_task_index is not None:
+                valid_starts = self._episode_valid_starts_for_task(data_path, num_frames)
+                if valid_starts.size == 0:
+                    continue
+                episode_task_index = int(self._resolved_task_index)
+            else:
+                if self._valid_window_count(num_frames) <= 0:
+                    continue
+                episode_task_index = self._episode_task_index(data_path)
             episodes.append(
                 {
                     "episode_index": episode_index,
                     "episode_chunk": episode_chunk,
                     "data_path": data_path,
-                    "num_frames": pq.read_metadata(data_path).num_rows,
+                    "num_frames": num_frames,
+                    "task_index": episode_task_index,
+                    "valid_starts": valid_starts,
                 }
             )
+            if max_episodes is not None and len(episodes) >= max_episodes:
+                break
         return episodes
 
     def _build_cumulative_sizes(self) -> list[int]:
         cumulative_sizes: list[int] = []
         total = 0
         for episode in self._episodes:
-            if self._fastwam_action_only:
-                total += max(0, int(episode["num_frames"]))
+            valid_starts = episode.get("valid_starts")
+            if valid_starts is not None:
+                total += int(len(valid_starts))
             else:
-                total += max(0, int(episode["num_frames"]) - self._chunk_length)
+                total += self._valid_window_count(int(episode["num_frames"]))
             cumulative_sizes.append(total)
         return cumulative_sizes
 
     def _locate_index(self, idx: int) -> tuple[dict[str, Any], int]:
-        if idx < 0 or idx >= len(self):
+        base_len = self._cumulative_sizes[-1] if self._cumulative_sizes else 0
+        if idx < 0 or idx >= len(self) or base_len <= 0:
             raise IndexError(idx)
+        idx = idx % base_len
         episode_idx = bisect_right(self._cumulative_sizes, idx)
         previous = 0 if episode_idx == 0 else self._cumulative_sizes[episode_idx - 1]
-        return self._episodes[episode_idx], idx - previous
+        episode = self._episodes[episode_idx]
+        local_idx = idx - previous
+        valid_starts = episode.get("valid_starts")
+        if valid_starts is not None:
+            return episode, int(valid_starts[local_idx])
+        return episode, local_idx
 
     def _choose_mode(self) -> str:
         if self._mode == "joint":
@@ -380,6 +495,11 @@ def get_robotwin_lerobot_sft_dataset(
     action_horizon: int | None = None,
     caption_prefix: str = "",
     max_episodes: int | None = None,
+    task_index: int | None = None,
+    task_name: str | None = None,
+    dataset_repeat: int = 1,
+    use_state: bool = False,
+    state_key: str | None = None,
     resolution: str | None = "480",
     tokenizer_config: dict | None = None,
     cfg_dropout_rate: float = 0.0,
@@ -415,6 +535,11 @@ def get_robotwin_lerobot_sft_dataset(
         action_horizon=action_horizon,
         caption_prefix=caption_prefix,
         max_episodes=max_episodes,
+        task_index=task_index,
+        task_name=task_name,
+        dataset_repeat=dataset_repeat,
+        use_state=use_state,
+        state_key=state_key,
     )
     transform = ActionTransformPipeline(
         keep_aspect_ratio=keep_aspect_ratio,
