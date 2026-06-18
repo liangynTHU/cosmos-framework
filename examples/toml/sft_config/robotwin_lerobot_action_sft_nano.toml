@@ -63,7 +63,7 @@ warm_up_steps      = [0]
 [trainer]
 distributed_parallelism = "fsdp"
 grad_accum_iter         = 1
-logging_iter            = 50
+logging_iter            = 1
 max_iter                = 10000
 
 [trainer.callbacks.compile_tokenizer]
