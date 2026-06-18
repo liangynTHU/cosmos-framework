@@ -26,6 +26,7 @@ Environment variables:
   MAX_EPISODES              Dataset max episodes override. Set empty or null to use all data if supported.
   ROBOTWIN_TASK_INDEX       Optional RoboTwin task_index filter. Keeps all episodes from this task.
   ROBOTWIN_TASK_NAME        Optional RoboTwin task name filter. Must match meta/tasks.jsonl exactly.
+  ROBOTWIN_EPISODE_INDICES  Optional comma-separated list of episode indices, e.g. "0,1,2,3,4,5". When set, all valid windows inside each listed episode are used. Combine with ROBOTWIN_TASK_INDEX/_NAME to additionally restrict by task.
   ROBOTWIN_DATASET_REPEAT   Repeat filtered dataset length, default 1. Useful for one-task overfit.
   ROBOTWIN_USE_STATE        Whether to prepend qpos/proprio state as the first action row, default true.
   ROBOTWIN_STATE_KEY        qpos/proprio parquet field, default observation.state.
@@ -255,6 +256,18 @@ else
     OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_name=null")
 fi
 
+if [[ -n "${ROBOTWIN_EPISODE_INDICES:-}" ]]; then
+    # 接受 "0,1,2" 或 "0 1 2" 或 "[0,1,2]" 多种写法，统一规范成 [0,1,2]。
+    _ep_clean="${ROBOTWIN_EPISODE_INDICES//[\[\]]/}"
+    _ep_clean="${_ep_clean// /,}"
+    while [[ "$_ep_clean" == *",,"* ]]; do _ep_clean="${_ep_clean//,,/,}"; done
+    _ep_clean="${_ep_clean#,}"
+    _ep_clean="${_ep_clean%,}"
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.episode_indices=[${_ep_clean}]")
+else
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.episode_indices=null")
+fi
+
 OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.dataset_repeat=${ROBOTWIN_DATASET_REPEAT:-1}")
 
 OVERRIDES+=("${EXTRA_OVERRIDES[@]}")
@@ -269,6 +282,7 @@ echo "DATASET_PATH=$DATASET_PATH"
 echo "OBSERVATION_IMAGE_MODE=$OBSERVATION_IMAGE_MODE"
 echo "ROBOTWIN_TASK_INDEX=${ROBOTWIN_TASK_INDEX:-}"
 echo "ROBOTWIN_TASK_NAME=${ROBOTWIN_TASK_NAME:-}"
+echo "ROBOTWIN_EPISODE_INDICES=${ROBOTWIN_EPISODE_INDICES:-}"
 echo "ROBOTWIN_DATASET_REPEAT=${ROBOTWIN_DATASET_REPEAT:-1}"
 echo "USE_CAMERA_SPECIAL_TOKENS=$USE_CAMERA_SPECIAL_TOKENS"
 echo "COSMOS_MODELS_ROOT=$COSMOS_MODELS_ROOT"
@@ -290,7 +304,7 @@ echo "SCHEDULER_WARM_UP_STEPS=${SCHEDULER_WARM_UP_STEPS:-}"
 echo "LOG_FILE=$LOG_FILE"
 echo "OVERRIDES=${OVERRIDES[*]}"
 
-env | grep -E '^(MASTER|NNODES|NODE_RANK|NPROC_PER_NODE|NCCL|UCX|CUDA|LD_LIBRARY_PATH|PYTORCH_CUDA_ALLOC_CONF|VLLM|WANDB|HF_|HUGGINGFACE|TRANSFORMERS|http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|no_proxy|NO_PROXY|COSMOS_MODELS_ROOT|BASE_CHECKPOINT_PATH|WAN_VAE_PATH|QWEN_TOKENIZER_PATH|TRAINING_NAME|OUTPUT_BASE_ROOT|IMAGINAIRE_OUTPUT_ROOT|OBSERVATION_IMAGE_MODE|ROBOTWIN_TASK_INDEX|ROBOTWIN_TASK_NAME|ROBOTWIN_DATASET_REPEAT|ROBOTWIN_USE_STATE|ROBOTWIN_STATE_KEY|OPTIMIZER_LR|SCHEDULER_F_MAX|SCHEDULER_F_MIN|SCHEDULER_WARM_UP_STEPS)=' | sort || true
+env | grep -E '^(MASTER|NNODES|NODE_RANK|NPROC_PER_NODE|NCCL|UCX|CUDA|LD_LIBRARY_PATH|PYTORCH_CUDA_ALLOC_CONF|VLLM|WANDB|HF_|HUGGINGFACE|TRANSFORMERS|http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|no_proxy|NO_PROXY|COSMOS_MODELS_ROOT|BASE_CHECKPOINT_PATH|WAN_VAE_PATH|QWEN_TOKENIZER_PATH|TRAINING_NAME|OUTPUT_BASE_ROOT|IMAGINAIRE_OUTPUT_ROOT|OBSERVATION_IMAGE_MODE|ROBOTWIN_TASK_INDEX|ROBOTWIN_TASK_NAME|ROBOTWIN_EPISODE_INDICES|ROBOTWIN_DATASET_REPEAT|ROBOTWIN_USE_STATE|ROBOTWIN_STATE_KEY|OPTIMIZER_LR|SCHEDULER_F_MAX|SCHEDULER_F_MIN|SCHEDULER_WARM_UP_STEPS)=' | sort || true
 
 PYTHONPATH=. torchrun \
     --nnodes="$NNODES" \

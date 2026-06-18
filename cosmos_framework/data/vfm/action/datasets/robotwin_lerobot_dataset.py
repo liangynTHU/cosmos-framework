@@ -85,6 +85,7 @@ class RobotTwinLeRobotDataset(Dataset):
         max_episodes: int | None = None,
         task_index: int | None = None,
         task_name: str | None = None,
+        episode_indices: list[int] | tuple[int, ...] | None = None,
         dataset_repeat: int = 1,
         use_state: bool = False,
         state_key: str | None = None,
@@ -120,6 +121,11 @@ class RobotTwinLeRobotDataset(Dataset):
         self._max_episodes = max_episodes
         self._task_index = int(task_index) if task_index is not None else None
         self._task_name = task_name.strip() if task_name else None
+        if episode_indices is None:
+            self._episode_indices: set[int] | None = None
+        else:
+            normalized = {int(i) for i in episode_indices}
+            self._episode_indices = normalized if normalized else None
         self._dataset_repeat = max(1, int(dataset_repeat))
         self._use_state = bool(use_state)
         self._state_key = state_key.strip() if state_key else None
@@ -134,7 +140,9 @@ class RobotTwinLeRobotDataset(Dataset):
         if not self._episodes:
             raise ValueError(
                 "No RoboTwin episodes matched the dataset filters: "
-                f"task_index={self._task_index}, task_name={self._task_name!r}, max_episodes={self._max_episodes}."
+                f"task_index={self._task_index}, task_name={self._task_name!r}, "
+                f"episode_indices={sorted(self._episode_indices) if self._episode_indices else None}, "
+                f"max_episodes={self._max_episodes}."
             )
 
     @property
@@ -335,7 +343,11 @@ class RobotTwinLeRobotDataset(Dataset):
         chunks_size = int(self._info.get("chunks_size", 1000))
         total_episodes = int(self._info["total_episodes"])
         max_episodes = int(self._max_episodes) if self._max_episodes is not None else None
-        for episode_index in range(total_episodes):
+        if self._episode_indices is not None:
+            candidate_indices = sorted(idx for idx in self._episode_indices if 0 <= idx < total_episodes)
+        else:
+            candidate_indices = range(total_episodes)
+        for episode_index in candidate_indices:
             episode_chunk = episode_index // chunks_size
             data_path = self._root / self._info["data_path"].format(
                 episode_chunk=episode_chunk,
@@ -497,6 +509,7 @@ def get_robotwin_lerobot_sft_dataset(
     max_episodes: int | None = None,
     task_index: int | None = None,
     task_name: str | None = None,
+    episode_indices: list[int] | tuple[int, ...] | None = None,
     dataset_repeat: int = 1,
     use_state: bool = False,
     state_key: str | None = None,
@@ -537,6 +550,7 @@ def get_robotwin_lerobot_sft_dataset(
         max_episodes=max_episodes,
         task_index=task_index,
         task_name=task_name,
+        episode_indices=episode_indices,
         dataset_repeat=dataset_repeat,
         use_state=use_state,
         state_key=state_key,

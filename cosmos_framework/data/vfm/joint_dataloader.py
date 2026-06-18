@@ -177,6 +177,7 @@ class JointDataLoader(webdataset.WebLoader):
         lookahead_limits: Dict[str, int] | None = None,
         uniae_chunk_frames: int | Mapping[str, int] | None = None,
         uniae_pad_frames: int | None = None,
+        infinite_data_stream: bool = False,
     ):
         """
         Initialize the JointDataLoader with multiple datasets.
@@ -227,6 +228,10 @@ class JointDataLoader(webdataset.WebLoader):
         self.default_lookahead_limit = int(default_lookahead_limit)
         self.uniae_pad_frames = int(uniae_pad_frames) if uniae_pad_frames is not None else None
         self.uniae_chunk_frames = self._normalize_uniae_chunk_frames(uniae_chunk_frames)
+        # When True, restart any underlying dataloader iterator on StopIteration so the
+        # data stream becomes effectively infinite.  This avoids NCCL hang at epoch end
+        # when, e.g., a small overfit dataset is exhausted while other ranks keep stepping.
+        self.infinite_data_stream = bool(infinite_data_stream)
 
         assert (self.max_sequence_length is None) != (self.max_samples_per_batch is None), (
             "Exactly one of max_sequence_length or max_samples_per_batch must be None, but not both."
@@ -507,7 +512,24 @@ class JointDataLoader(webdataset.WebLoader):
             try:
                 batch = next(self.dataloaders[index_id])
             except StopIteration:
-                raise
+                if not self.infinite_data_stream:
+                    raise
+                # Underlying dataloader has been fully consumed (typical for finite
+                # map-style datasets).  Recreate the iterator to start a new epoch so
+                # the training loop never stalls in NCCL collectives.  Note: this only
+                # rebuilds the Python-side iterator; the wrapped DataLoader/WebLoader
+                # (and its persistent workers, if any) is reused as-is.
+                log.info(
+                    f"JointDataLoader: dataloader index={index_id} exhausted; "
+                    f"restarting iterator (infinite_data_stream=True).",
+                    rank0_only=False,
+                )
+                self.dataloaders[index_id] = iter(self.dataloader_list[index_id])
+                try:
+                    batch = next(self.dataloaders[index_id])
+                except StopIteration:
+                    # Truly empty dataloader — propagate so the caller can stop cleanly.
+                    raise
 
             is_image_batch = "images" in batch
             input_images_or_videos = batch["images" if is_image_batch else "video"]
@@ -839,6 +861,7 @@ class PackingDataLoader(JointDataLoader):
         lookahead_limit: int = JointDataLoader._DEFAULT_LOOKAHEAD_LIMIT,
         uniae_chunk_frames: int | Mapping[str, int] | None = None,
         uniae_pad_frames: int | None = None,
+        infinite_data_stream: bool = False,
     ):
         """
         Args:
@@ -870,6 +893,7 @@ class PackingDataLoader(JointDataLoader):
             lookahead_limits={dataset_name: int(lookahead_limit)},
             uniae_chunk_frames=uniae_chunk_frames,
             uniae_pad_frames=uniae_pad_frames,
+            infinite_data_stream=infinite_data_stream,
         )
 
     def __iter__(self):
