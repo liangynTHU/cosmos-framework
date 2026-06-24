@@ -46,6 +46,12 @@ _MULTI_IMAGE_CAMERA_DESCRIPTION = (
 _MODE_CHOICES = ("forward_dynamics", "policy")
 _OBSERVATION_IMAGE_MODE_CHOICES = ("concat", "multi_image")
 
+# RoboTwin2.0 把粗任务 (adjust_bottle / beat_block_hammer / ...) 按 episode 连续成段排列,
+# 每个任务默认 550 个 episode。task_index=k 选第 k 段 -> episode [k*N, k*N+N-1]。
+# 注意: 这跟 parquet 里每帧的 "task_index" 列 (对应 meta/tasks.jsonl 的 ~92 万条细粒度
+# 指令文本) 不是一回事; 这里的 task_index 是粗任务号。
+_DEFAULT_EPISODES_PER_TASK = 550
+
 
 class RobotTwinLeRobotDataset(Dataset):
     """RoboTwin LeRobot v2.1 action dataset with concat or multi-image observations.
@@ -83,9 +89,10 @@ class RobotTwinLeRobotDataset(Dataset):
         action_horizon: int | None = None,
         caption_prefix: str = "",
         max_episodes: int | None = None,
-        task_index: int | None = None,
+        task_index: int | list[int] | tuple[int, ...] | None = None,
         task_name: str | None = None,
         episode_indices: list[int] | tuple[int, ...] | None = None,
+        episodes_per_task: int = _DEFAULT_EPISODES_PER_TASK,
         dataset_repeat: int = 1,
         use_state: bool = False,
         state_key: str | None = None,
@@ -119,13 +126,44 @@ class RobotTwinLeRobotDataset(Dataset):
         self._normalize_action = bool(normalize_action)
         self._caption_prefix = caption_prefix.strip()
         self._max_episodes = max_episodes
-        self._task_index = int(task_index) if task_index is not None else None
+        # task_index 支持单个 (0) 或多个 ([0,2,5]); 统一归一成 sorted list, 无则 None。
+        if task_index is None:
+            self._task_indices: list[int] | None = None
+        elif isinstance(task_index, (list, tuple, set)):
+            normalized_ti = sorted({int(i) for i in task_index})
+            self._task_indices = normalized_ti if normalized_ti else None
+        else:
+            self._task_indices = [int(task_index)]
         self._task_name = task_name.strip() if task_name else None
+        self._episodes_per_task = int(episodes_per_task)
         if episode_indices is None:
             self._episode_indices: set[int] | None = None
         else:
             normalized = {int(i) for i in episode_indices}
             self._episode_indices = normalized if normalized else None
+
+        # 粗任务号 -> episode 区间。task_index=k 选第 k 个 N-episode 段: episode [k*N, k*N+N-1]。
+        # 多个 task 取并集。直接塞进 _episode_indices, 复用 episode 选择路径, 不走按帧
+        # task_index 列过滤的旧逻辑 (那个匹配的是 meta/tasks.jsonl 细粒度指令)。
+        if self._task_indices is not None:
+            if self._task_name is not None:
+                raise ValueError(
+                    "RoboTwin: task_index (粗任务号) 与 task_name 不能同时指定; "
+                    "task_index 走 episode 区间选择, task_name 走指令文本匹配。"
+                )
+            if self._episodes_per_task <= 0:
+                raise ValueError(f"episodes_per_task must be positive, got {self._episodes_per_task}.")
+            if any(k < 0 for k in self._task_indices):
+                raise ValueError(f"task_index (粗任务号) must all be >= 0, got {self._task_indices}.")
+            task_eps: set[int] = set()
+            for k in self._task_indices:
+                start = k * self._episodes_per_task
+                task_eps.update(range(start, start + self._episodes_per_task))
+            # 若同时显式给了 episode_indices, 取交集 (在这些任务内进一步细选); 否则用整段并集。
+            self._episode_indices = (
+                task_eps if self._episode_indices is None else (self._episode_indices & task_eps)
+            )
+
         self._dataset_repeat = max(1, int(dataset_repeat))
         self._use_state = bool(use_state)
         self._state_key = state_key.strip() if state_key else None
@@ -134,13 +172,16 @@ class RobotTwinLeRobotDataset(Dataset):
         self._info = json.loads((self._root / "meta" / "info.json").read_text())
         self._fps = float(fps if fps is not None else self._info.get("fps", 50.0))
         self._tasks = self._load_tasks()
-        self._resolved_task_index = self._resolve_task_filter()
+        # 粗任务号已转成 episode 区间, 不再用按帧 task_index 列过滤 -> 置 None 走 episode 路径。
+        # task_name (指令文本匹配) 仍走原逻辑。
+        self._resolved_task_index = None if self._task_indices is not None else self._resolve_task_filter()
         self._episodes = self._load_episode_index()
         self._cumulative_sizes = self._build_cumulative_sizes()
         if not self._episodes:
             raise ValueError(
                 "No RoboTwin episodes matched the dataset filters: "
-                f"task_index={self._task_index}, task_name={self._task_name!r}, "
+                f"task_index={self._task_indices} (coarse, episodes_per_task={self._episodes_per_task}), "
+                f"task_name={self._task_name!r}, "
                 f"episode_indices={sorted(self._episode_indices) if self._episode_indices else None}, "
                 f"max_episodes={self._max_episodes}."
             )
@@ -303,19 +344,15 @@ class RobotTwinLeRobotDataset(Dataset):
         )
 
     def _resolve_task_filter(self) -> int | None:
+        # 仅在没有粗任务号 (task_indices is None) 时被调用。此时若也没 task_name 则不过滤;
+        # 否则把 task_name 解析成 meta/tasks.jsonl 的 task_index (按帧过滤的旧逻辑)。
         if self._task_name is None:
-            return self._task_index
+            return None
         matched = [idx for idx, name in self._tasks.items() if name == self._task_name]
         if not matched:
             examples = ", ".join(f"{idx}:{name}" for idx, name in sorted(self._tasks.items())[:10])
             raise ValueError(f"Unknown RoboTwin task_name {self._task_name!r}. Available examples: {examples}")
-        resolved = matched[0]
-        if self._task_index is not None and self._task_index != resolved:
-            raise ValueError(
-                f"RoboTwin task filter mismatch: task_index={self._task_index} but "
-                f"task_name={self._task_name!r} resolves to task_index={resolved}."
-            )
-        return resolved
+        return matched[0]
 
     def _episode_task_index(self, data_path: Path) -> int:
         table = pq.ParquetFile(data_path).read_row_group(0, columns=["task_index"])
@@ -507,9 +544,10 @@ def get_robotwin_lerobot_sft_dataset(
     action_horizon: int | None = None,
     caption_prefix: str = "",
     max_episodes: int | None = None,
-    task_index: int | None = None,
+    task_index: int | list[int] | tuple[int, ...] | None = None,
     task_name: str | None = None,
     episode_indices: list[int] | tuple[int, ...] | None = None,
+    episodes_per_task: int = _DEFAULT_EPISODES_PER_TASK,
     dataset_repeat: int = 1,
     use_state: bool = False,
     state_key: str | None = None,
@@ -551,6 +589,7 @@ def get_robotwin_lerobot_sft_dataset(
         task_index=task_index,
         task_name=task_name,
         episode_indices=episode_indices,
+        episodes_per_task=episodes_per_task,
         dataset_repeat=dataset_repeat,
         use_state=use_state,
         state_key=state_key,
