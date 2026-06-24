@@ -121,11 +121,29 @@ if [[ -z "$EXP_IP_LIST" || "$DISCOVERED_NNODES" -eq 0 ]]; then
     exit 1
 fi
 
+# NODE_RANK_OFFSET: starting global rank for the nodes this launcher drives.
+# Multi-head launch (e.g. two 8-node machines forming one 16-node job): run this
+# script on each head with that head's own EXP_IP_LIST (its local nodes), the
+# SAME global NNODES, and a distinct NODE_RANK_OFFSET so global ranks don't
+# collide. Example: machine A -> EXP_IP_LIST=<A's 8 IPs> NNODES=16 (offset 0,
+# ranks 0-7); machine B -> EXP_IP_LIST=<B's 8 IPs> NNODES=16 NODE_RANK_OFFSET=8
+# (ranks 8-15). MASTER_ADDR must be the SAME global rank-0 host on both heads.
+# Default 0 keeps the single-head case unchanged.
+NODE_RANK_OFFSET="${NODE_RANK_OFFSET:-0}"
+
+# NNODES is the GLOBAL node count; EXP_IP_LIST holds only THIS head's local
+# nodes. Single-head: NNODES defaults to the local count. Multi-head: NNODES is
+# set explicitly (> local count) and we only require that this head's slice
+# (offset .. offset+local-1) fits inside [0, NNODES).
 NNODES="${NNODES:-$DISCOVERED_NNODES}"
-if [[ "$DISCOVERED_NNODES" -ne "$NNODES" ]]; then
-    echo "ERROR: node-list count ($DISCOVERED_NNODES) != NNODES ($NNODES)." >&2
+if (( NODE_RANK_OFFSET + DISCOVERED_NNODES > NNODES )); then
+    echo "ERROR: NODE_RANK_OFFSET ($NODE_RANK_OFFSET) + local node count ($DISCOVERED_NNODES) > NNODES ($NNODES)." >&2
     echo "EXP_IP_LIST=$EXP_IP_LIST" >&2
     exit 1
+fi
+if (( NODE_RANK_OFFSET == 0 && DISCOVERED_NNODES != NNODES )); then
+    echo "WARN: this head drives only $DISCOVERED_NNODES of $NNODES global nodes (NODE_RANK_OFFSET=0)." >&2
+    echo "      If using multi-head launch, start the remaining nodes on the other head(s) with matching NODE_RANK_OFFSET." >&2
 fi
 
 MASTER_ADDR="${MASTER_ADDR:-${EXP_IP_LIST%%,*}}"
@@ -162,7 +180,7 @@ IFS=',' read -ra IP_ARRAY <<< "$EXP_IP_LIST"
 
 for i in "${!IP_ARRAY[@]}"; do
     NODE_IP="${IP_ARRAY[i]}"
-    NODE_RANK="$i"
+    NODE_RANK="$(( NODE_RANK_OFFSET + i ))"
 
     echo "Starting node $NODE_RANK ($NODE_IP)..."
 
