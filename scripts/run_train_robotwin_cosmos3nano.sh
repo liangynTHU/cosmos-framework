@@ -24,9 +24,10 @@ Environment variables:
   MAX_ITER                  Training iterations override.
   SAVE_ITER                 Checkpoint save interval override.
   MAX_EPISODES              Dataset max episodes override. Set empty or null to use all data if supported.
-  ROBOTWIN_TASK_INDEX       Optional RoboTwin task_index filter. Keeps all episodes from this task.
-  ROBOTWIN_TASK_NAME        Optional RoboTwin task name filter. Must match meta/tasks.jsonl exactly.
-  ROBOTWIN_EPISODE_INDICES  Optional comma-separated list of episode indices, e.g. "0,1,2,3,4,5". When set, all valid windows inside each listed episode are used. Combine with ROBOTWIN_TASK_INDEX/_NAME to additionally restrict by task.
+  ROBOTWIN_TASK_INDEX       Optional coarse task index. RoboTwin tasks are stored as contiguous episode blocks (default 550 each); task_index=k selects episodes [k*N, k*N+N-1]. NOT the per-frame task_index of meta/tasks.jsonl.
+  ROBOTWIN_EPISODES_PER_TASK  Episodes per coarse task, default 550. Only used with ROBOTWIN_TASK_INDEX.
+  ROBOTWIN_TASK_NAME        Optional RoboTwin task name filter. Must match meta/tasks.jsonl exactly. Mutually exclusive with ROBOTWIN_TASK_INDEX.
+  ROBOTWIN_EPISODE_INDICES  Optional comma-separated list of episode indices, e.g. "0,1,2,3,4,5". When set with ROBOTWIN_TASK_INDEX, intersected with that task's block (further sub-select).
   ROBOTWIN_DATASET_REPEAT   Repeat filtered dataset length, default 1. Useful for one-task overfit.
   ROBOTWIN_USE_STATE        Whether to prepend qpos/proprio state as the first action row, default true.
   ROBOTWIN_STATE_KEY        qpos/proprio parquet field, default observation.state.
@@ -245,9 +246,21 @@ if [[ -n "${ROBOTWIN_VIEWPOINT:-}" ]]; then
 fi
 
 if [[ -n "${ROBOTWIN_TASK_INDEX:-}" ]]; then
-    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_index=$ROBOTWIN_TASK_INDEX")
+    # 粗任务号: task_index=k 选第 k 个 episode 段 -> episode [k*N, k*N+N-1] (N=episodes_per_task)。
+    # 不是 meta/tasks.jsonl 的细粒度指令 task_index。支持单个 "0" 或多个 "0,2,5" (多任务取并集)。
+    # 接受 "0,2,5" / "0 2 5" / "[0,2,5]" 多种写法, 统一规范成 [0,2,5] (单个 -> [0])。
+    _ti_clean="${ROBOTWIN_TASK_INDEX//[\[\]]/}"
+    _ti_clean="${_ti_clean// /,}"
+    while [[ "$_ti_clean" == *",,"* ]]; do _ti_clean="${_ti_clean//,,/,}"; done
+    _ti_clean="${_ti_clean#,}"
+    _ti_clean="${_ti_clean%,}"
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_index=[${_ti_clean}]")
 else
     OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.task_index=null")
+fi
+
+if [[ -n "${ROBOTWIN_EPISODES_PER_TASK:-}" ]]; then
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.episodes_per_task=$ROBOTWIN_EPISODES_PER_TASK")
 fi
 
 if [[ -n "${ROBOTWIN_TASK_NAME:-}" ]]; then
