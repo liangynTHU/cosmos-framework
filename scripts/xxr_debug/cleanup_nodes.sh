@@ -1,0 +1,2 @@
+pdsh -w 29.191.210.123,29.127.64.8,29.127.65.89,29.119.84.187,29.127.82.110,29.191.209.108,29.119.97.119,29.119.99.50 \
+"ps -ef | grep -E 'cosmos_framework.scripts.train|torchrun|pt_elastic|run_pdsh_robotwin|robotwin_lerobot_action_sft' | grep -v grep | awk '{print \$2}' | xargs -r kill -TERM; sleep 5; ps -ef | grep -E 'cosmos_framework.scripts.train|torchrun|pt_elastic|run_pdsh_robotwin|robotwin_lerobot_action_sft' | grep -v grep | awk '{print \$2}' | xargs -r kill -9"
