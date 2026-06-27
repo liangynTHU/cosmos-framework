@@ -15,7 +15,7 @@ NNODES=8
 MASTER_ADDR=29.191.210.123
 MASTER_PORT=50221
 NPROC_PER_NODE=8
-COSMOS_WORKDIR=/mnt/lyn/wjh/workspace/cosmos3/wam   # 含分片改动的 checkout
+COSMOS_WORKDIR=/mnt/lyn/xxr/cosmos-framework   # 含分片改动的 checkout
 
 # ---- 数据 (5 episode 过拟合) ----
 ROBOTWIN_MODE=policy

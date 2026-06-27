@@ -144,6 +144,30 @@ class FixedStepSamplerConfig:
     sample_type: str = "ode"
 
 
+@attrs.define(slots=False)
+class FastWAMActionOnlyConfig:
+    enabled: bool = False
+    action_horizon: int = 16
+    action_dim: int | None = None
+    control_fps: int = 15
+    obs_frames: int = 1
+    future_video_frames: int = 16
+    action_loss_weight: float = 1.0
+    video_aux_loss_weight: float = 1.0
+    use_video_aux_loss: bool = True
+    use_action_loss: bool = True
+    inference_output: str = "action_only"
+    disable_future_video_tokens_at_inference: bool = True
+    disable_video_decode_at_inference: bool = True
+    save_debug_video: bool = False
+    action_denoising_steps: int | None = None
+    execute_horizon: int | None = None
+    strict_no_future_video_to_action: bool = True
+    assert_attention_mask: bool = True
+    assert_no_video_decode_in_inference: bool = True
+    allow_lambda_video_zero: bool = True
+
+
 # Don't have any defaults and init only in config file.
 @attrs.define(slots=False)
 class OmniMoTModelConfig:
@@ -186,9 +210,20 @@ class OmniMoTModelConfig:
     # Optional fixed-step sampler for distilled models (None for base models).
     fixed_step_sampler_config: FixedStepSamplerConfig | None = None
 
+    # FastWAM-style Cosmos3 mode. Defaults keep all legacy Cosmos behavior unchanged.
+    wam_mode: str = attrs.field(
+        default="cosmos_default",
+        validator=attrs.validators.in_({"cosmos_default", "fastwam_action_only"}),
+    )
+    fastwam_action_only: FastWAMActionOnlyConfig = FastWAMActionOnlyConfig()
+
     # Model configs
     vlm_config: VLMConfig = VLMConfig()
     diffusion_expert_config: DiffusionExpertConfig = DiffusionExpertConfig()
+    # Add camera marker tokens such as ``<cam_high>`` to the text tokenizer and
+    # resize text embeddings. Keep this off for legacy concat runs so their
+    # tokenizer/model vocabulary stays unchanged.
+    use_camera_special_tokens: bool = False
     # Training data keys
     input_video_key: str = "video"
     input_image_key: str = "images"  # key to fetch input image from data_batch

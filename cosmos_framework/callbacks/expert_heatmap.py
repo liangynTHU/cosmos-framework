@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-import matplotlib.pyplot as plt
 import torch
 import wandb
 from torch.distributed.tensor import DTensor, Partial
@@ -93,6 +92,8 @@ class ExpertHeatmap(EveryN):
         expert_heatmaps = compute_expert_heatmap(model.net)
 
         if distributed.is_rank0() and wandb.run:
+            import matplotlib.pyplot as plt
+
             for tower, heatmap in expert_heatmaps.items():
                 fig, ax = plt.subplots()
                 im = ax.imshow(heatmap.cpu().numpy())

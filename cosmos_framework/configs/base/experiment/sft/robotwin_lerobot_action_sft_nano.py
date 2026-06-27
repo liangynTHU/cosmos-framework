@@ -1,61 +1,37 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""``action_policy_droid_nano`` — Cosmos3-Nano DROID action policy SFT recipe.
-
-Mirrors the vision SFT stack (PackingDataLoader + RankPartitionedDataLoader),
-but feeds the DROID action dataset (``joint_pos`` 8D + ``use_state``, raw/
-un-normalized — same as the internal ``droid_lerobot_8b_policy`` run) through
-``ActionTransformPipeline``, and trains the generation + action heads from the
-public ``nvidia/Cosmos3-Nano`` base.
-
-Usage (1 node, 8 GPU)::
-
-    DROID_ROOT=/path/to/droid_lerobot_640x360/success \\
-    BASE_CHECKPOINT_PATH=<Cosmos3-Nano DCP dir> \\
-    WAN_VAE_PATH=<Wan2.2_VAE.pth> \\
-    torchrun --nproc_per_node=8 -m cosmos_framework.scripts.train \\
-        --sft-toml examples/toml/sft_config/action_policy_droid_repro.toml
-"""
+"""RoboTwin LeRobot Action SFT recipe for Cosmos3-Nano."""
 
 import copy
 
 from hydra.core.config_store import ConfigStore
 
+from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
+from cosmos_framework.data.vfm.action.datasets.robotwin_lerobot_dataset import get_robotwin_lerobot_sft_dataset
+from cosmos_framework.data.vfm.joint_dataloader import PackingDataLoader, RankPartitionedDataLoader
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.lazy_config import LazyDict
 
-from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
-from cosmos_framework.data.vfm.joint_dataloader import (
-    PackingDataLoader,
-    RankPartitionedDataLoader,
-)
-from cosmos_framework.data.vfm.action.datasets.action_sft_dataset import get_action_droid_sft_dataset
-
 cs = ConfigStore.instance()
 
+_model_config = copy.deepcopy(NANO_MODEL_CONFIG)
+_model_config["resolution"] = "480"
+_model_config["max_num_tokens_after_packing"] = 12288
+_model_config["compile"]["enabled"] = False
+_model_config["parallelism"]["data_parallel_shard_degree"] = -1
+_model_config["tokenizer"]["vae_path"] = "${oc.env:WAN_VAE_PATH}"
 
-action_policy_droid_nano = LazyDict(
+robotwin_lerobot_action_sft_nano = LazyDict(
     dict(
         defaults=[
             {"override /model": "mot_fsdp"},
             {"override /data_train": None},
             {"override /data_val": None},
-            # Match internal droid_lerobot_8b_policy: apex FusedAdam with fp32
-            # master_weights + eps 1e-8. adamw + fused + eps 1e-6 (bf16, no fp32
-            # master) under-steps the small 5x-lr action heads and leaves the action
-            # loss on a noisy high plateau; an exact-match forward/optimizer test
-            # confirmed the convergence gap was the optimizer, not the model.
             {"override /optimizer": "fusedadamw"},
-            {"override /scheduler": "lambdalinear"},  # matches internal droid_lerobot_8b (was lambdacosine)
+            {"override /scheduler": "lambdalinear"},
             {"override /checkpoint": "s3"},
-            {
-                "override /callbacks": [
-                    "basic",
-                    "optimization",
-                    "job_monitor",
-                ]
-            },
+            {"override /callbacks": ["basic", "optimization", "job_monitor"]},
             {"override /ema": "power"},
             {"override /tokenizer": "wan2pt2_tokenizer"},
             {"override /sound_tokenizer": None},
@@ -66,17 +42,14 @@ action_policy_droid_nano = LazyDict(
         job=dict(
             project="cosmos3",
             group="action_sft",
-            name="action_policy_droid_nano",
+            name="robotwin_lerobot_action_sft_nano",
             wandb_mode="disabled",
         ),
-        model=dict(
-            config=copy.deepcopy(NANO_MODEL_CONFIG),  # action_gen=True, max_action_dim=64
-        ),
+        model=dict(config=_model_config),
         optimizer=dict(
             betas=[0.9, 0.99],
             eps=1.0e-08,
-            fused=True,  # popped by build_optimizer for FusedAdam (fused by construction)
-            # Generation + action heads (mirrors internal droid_lerobot_8b_policy).
+            fused=True,
             keys_to_select=[
                 "moe_gen",
                 "time_embedder",
@@ -86,7 +59,7 @@ action_policy_droid_nano = LazyDict(
                 "llm2action",
                 "action_modality_embed",
             ],
-            lr=2.0e-04,  # matches internal droid_lerobot_8b_policy submit (--lr 2e-4)
+            lr=2.0e-04,
             lr_multipliers={
                 "action2llm": 5.0,
                 "llm2action": 5.0,
@@ -96,8 +69,8 @@ action_policy_droid_nano = LazyDict(
             weight_decay=0.05,
         ),
         scheduler=dict(
-            lr_scheduler_type="LambdaLinear",  # matches internal droid_lerobot_8b (was LambdaCosine)
-            cycle_lengths=[100],  # smoke: 100 iters (real run sets via TOML)
+            lr_scheduler_type="LambdaLinear",
+            cycle_lengths=[100],
             f_max=[0.4],
             f_min=[0.0],
             f_start=[0.0],
@@ -108,7 +81,7 @@ action_policy_droid_nano = LazyDict(
             distributed_parallelism="fsdp",
             grad_accum_iter=1,
             logging_iter=1,
-            max_iter=100,  # smoke
+            max_iter=100,
             max_val_iter=None,
             run_validation=False,
             run_validation_on_start=False,
@@ -122,10 +95,8 @@ action_policy_droid_nano = LazyDict(
             grad_scaler_args=dict(enabled=False),
             callbacks=dict(
                 dataloader_speed=dict(every_n=100, save_s3=False, step_size=1),
-                device_monitor=dict(
-                    every_n=200, log_memory_detail=True, save_s3=False, step_size=1, upload_every_n_mul=5
-                ),
-                grad_clip=dict(clip_norm=1.0, force_finite=True),  # matches internal make_8b
+                device_monitor=dict(every_n=200, log_memory_detail=True, save_s3=False, step_size=1, upload_every_n_mul=5),
+                grad_clip=dict(clip_norm=1.0, force_finite=True),
                 heart_beat=dict(every_n=200, save_s3=False, step_size=1, update_interval_in_minute=20),
                 iter_speed=dict(every_n=1, hit_thres=50, save_s3=False, save_s3_every_log_n=500),
                 low_precision=dict(update_iter=1),
@@ -140,10 +111,6 @@ action_policy_droid_nano = LazyDict(
             dcp_async_mode_enabled=False,
             enable_gcs_patch_in_boto3=True,
             keys_not_to_resume=[],
-            # Skip net_ema. (→ EMA warm-start copies net→net_ema, see dcp.py) AND the
-            # action heads, so they init fresh from the base — matches internal
-            # make_8b _DEFAULT_KEYS_TO_SKIP (Cosmos3-Nano's action heads are not
-            # DROID-policy-trained).
             keys_to_skip_loading=[
                 "net_ema.",
                 "action2llm",
@@ -152,11 +119,11 @@ action_policy_droid_nano = LazyDict(
                 "action_pos_embed",
             ],
             load_ema_to_reg=False,
-            load_path="???",  # Cosmos3-Nano DCP dir; supply via TOML/env
+            load_path="${oc.env:BASE_CHECKPOINT_PATH}",
             load_training_state=False,
             only_load_scheduler_state=False,
             save_iter=100,
-            strict_resume=False,  # base init: tolerate key set differences
+            strict_resume=False,
             verbose=True,
             hf_export=dict(
                 enabled=False,
@@ -170,9 +137,9 @@ action_policy_droid_nano = LazyDict(
         ),
         dataloader_train=L(PackingDataLoader)(
             audio_sample_rate=48000,
-            dataset_name="action_droid",
-            max_samples_per_batch=128,  # count-based batch (matches internal res480 8B)
-            max_sequence_length=None,  # None disables token packing (TOML can't express null)
+            dataset_name="robotwin_lerobot",
+            max_samples_per_batch=128,
+            max_sequence_length=None,
             patch_spatial=2,
             sound_latent_fps=0,
             tokenizer_spatial_compression_factor=16,
@@ -186,25 +153,32 @@ action_policy_droid_nano = LazyDict(
                 prefetch_factor=4,
                 sampler=None,
                 datasets=dict(
-                    droid=dict(
+                    robotwin=dict(
                         ratio=1,
-                        dataset=L(get_action_droid_sft_dataset)(
-                            root="${oc.env:DROID_ROOT}",
-                            fps=15.0,
-                            chunk_length=32,
-                            action_space="joint_pos",
+                        dataset=L(get_robotwin_lerobot_sft_dataset)(
+                            root="${oc.env:DATASET_PATH}",
+                            camera_key="observation.images.cam_high",
+                            observation_image_mode="concat",
+                            chunk_length=16,
+                            mode="policy",
+                            wam_mode="cosmos_default",
+                            future_video_frames=None,
+                            action_horizon=None,
+                            max_episodes=None,
                             use_state=True,
-                            use_image_augmentation=True,  # SR boost (random crop+rescale + color jitter)
-                            # Keep-ranges window filter (drops idle/non-task frames). Off by default;
-                            # the launcher sets use_filter_dict=True + filter_dict_path for internal parity.
-                            use_filter_dict=False,
-                            filter_dict_path=None,
-                            action_normalization=None,
-                            viewpoint="concat_view",  # wrist 480p (top) + L/R shoulder 320x180 (bottom)
-                            resolution="480",  # 640x360 data @ 480p (matches internal res480 run)
-                            max_action_dim="${model.config.max_action_dim}",
-                            cfg_dropout_rate=0.1,
+                            state_key="observation.state",
+                            action_normalization="quantile",
+                            action_space="joint_delta",
+                            resolution="480",
                             tokenizer_config="${model.config.vlm_config.tokenizer}",
+                            cfg_dropout_rate=0.0,
+                            max_action_dim=64,
+                            action_channel_masking=True,
+                            append_duration_fps_timestamps=True,
+                            append_resolution_info=True,
+                            append_viewpoint_info=False,
+                            video_temporal_downsample=4,
+                            keep_aspect_ratio=True,
                         ),
                     ),
                 ),
@@ -216,13 +190,9 @@ action_policy_droid_nano = LazyDict(
     flags={"allow_objects": True},
 )
 
-
-# chunk_length=32 → 33 observation frames; pin the VAE encode duration to match
-# (internal used [17] for chunk_length=16). Set post-construction so it lands on
-# the deep-copied NANO_MODEL_CONFIG.tokenizer.
-action_policy_droid_nano["model"]["config"]["tokenizer"]["encode_exact_durations"] = [33]
-
-
-for _item in [action_policy_droid_nano]:
-    _name = [k for k, v in globals().items() if v is _item][0]
-    cs.store(group="experiment", package="_global_", name=_name, node=_item)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="robotwin_lerobot_action_sft_nano",
+    node=robotwin_lerobot_action_sft_nano,
+)

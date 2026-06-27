@@ -1061,6 +1061,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             num_action_tokens_per_supertoken=num_action_tokens_per_supertoken,
             null_action_supertokens=packed_seq.null_action_supertokens,
             pad_for_cuda_graphs=self.pad_for_cuda_graphs,
+            fastwam_token_group_ids=packed_seq.token_group_ids if packed_seq.fastwam_action_only else None,
         )
 
         input_pack, packed_position_ids = get_context_parallel_sharded_sequence(

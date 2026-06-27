@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Dict, Union
 import numpy as np
 import torch
 import webdataset
+from torch.utils.data import DistributedSampler
 from torch.utils.data.dataloader import default_collate
 
 from cosmos_framework.utils.lazy_config import instantiate
@@ -177,6 +178,7 @@ class JointDataLoader(webdataset.WebLoader):
         lookahead_limits: Dict[str, int] | None = None,
         uniae_chunk_frames: int | Mapping[str, int] | None = None,
         uniae_pad_frames: int | None = None,
+        infinite_data_stream: bool = False,
     ):
         """
         Initialize the JointDataLoader with multiple datasets.
@@ -227,6 +229,10 @@ class JointDataLoader(webdataset.WebLoader):
         self.default_lookahead_limit = int(default_lookahead_limit)
         self.uniae_pad_frames = int(uniae_pad_frames) if uniae_pad_frames is not None else None
         self.uniae_chunk_frames = self._normalize_uniae_chunk_frames(uniae_chunk_frames)
+        # When True, restart any underlying dataloader iterator on StopIteration so the
+        # data stream becomes effectively infinite.  This avoids NCCL hang at epoch end
+        # when, e.g., a small overfit dataset is exhausted while other ranks keep stepping.
+        self.infinite_data_stream = bool(infinite_data_stream)
 
         assert (self.max_sequence_length is None) != (self.max_samples_per_batch is None), (
             "Exactly one of max_sequence_length or max_samples_per_batch must be None, but not both."
@@ -507,7 +513,24 @@ class JointDataLoader(webdataset.WebLoader):
             try:
                 batch = next(self.dataloaders[index_id])
             except StopIteration:
-                raise
+                if not self.infinite_data_stream:
+                    raise
+                # Underlying dataloader has been fully consumed (typical for finite
+                # map-style datasets).  Recreate the iterator to start a new epoch so
+                # the training loop never stalls in NCCL collectives.  Note: this only
+                # rebuilds the Python-side iterator; the wrapped DataLoader/WebLoader
+                # (and its persistent workers, if any) is reused as-is.
+                log.info(
+                    f"JointDataLoader: dataloader index={index_id} exhausted; "
+                    f"restarting iterator (infinite_data_stream=True).",
+                    rank0_only=False,
+                )
+                self.dataloaders[index_id] = iter(self.dataloader_list[index_id])
+                try:
+                    batch = next(self.dataloaders[index_id])
+                except StopIteration:
+                    # Truly empty dataloader — propagate so the caller can stop cleanly.
+                    raise
 
             is_image_batch = "images" in batch
             input_images_or_videos = batch["images" if is_image_batch else "video"]
@@ -705,11 +728,36 @@ class RankPartitionedDataLoader:
 
         - Ranks   0-95  -> video  (shard_world_size=96, shard_rank=0..95)
         - Ranks  96-127 -> image  (shard_world_size=32, shard_rank=0..31)
+
+    Map-style sharding:
+        Historically the ``shard_rank`` / ``shard_world_size`` attributes were
+        merely *attached* to the dataset, and each dataset was expected to
+        shard itself.  Action datasets (RoboTwin, bridge, droid, ...) are plain
+        map-style ``torch.utils.data.Dataset`` subclasses that never consumed
+        those attributes, so every rank in a dataset's group iterated the
+        *full* dataset in the *same* order — wasting all but one rank's compute
+        and (without shuffle) producing byte-identical batches on every rank.
+
+        When ``shard_map_style_dataset=True`` (default), a map-style dataset
+        (one exposing ``__len__``) is wrapped in a ``DistributedSampler``
+        parameterised by the dataset-group ``shard_rank`` / ``shard_world_size``
+        so each rank sees a disjoint, equally-sized 1/N partition.  Set it to
+        ``False`` to restore the legacy "every rank sees everything" behaviour
+        (e.g. tiny single-trajectory overfit runs where full replication is
+        intentional).  Iterable-style datasets (no ``__len__``) are assumed to
+        shard themselves and are left untouched regardless of this flag.
+
+        Note: ``set_epoch`` is intentionally not called, so the sampler's
+        permutation is identical every epoch.  This keeps sharding fully
+        deterministic and per-rank independent, which is required for safe
+        interaction with ``infinite_data_stream`` (where ranks may rebuild
+        their iterators at different times).
     """
 
     def __init__(
         self,
         datasets: dict[str, dict[str, Any]],
+        shard_map_style_dataset: bool = True,
         **dataloader_kwargs: Any,
     ):
         """
@@ -721,6 +769,16 @@ class RankPartitionedDataLoader:
                 - ``"dataloader_kwargs"`` (optional): dict of keyword arguments
                   that override the top-level ``**dataloader_kwargs`` for this
                   dataset only (e.g. different ``num_workers`` or ``batch_size``).
+
+            shard_map_style_dataset: When ``True`` (default), wrap a map-style
+                dataset in a ``DistributedSampler`` using the dataset-group
+                ``shard_rank`` / ``shard_world_size`` so each rank gets a
+                disjoint, equal-sized partition.  ``shuffle`` (default ``False``)
+                and ``drop_last`` (default ``False``) are read from
+                ``dataloader_kwargs``, forwarded to the sampler, and removed
+                from the ``DataLoader`` kwargs (a sampler is mutually exclusive
+                with ``shuffle``).  When ``False``, no sampler is created and
+                every rank iterates the full dataset (legacy behaviour).
 
             **dataloader_kwargs: Default kwargs forwarded to
                 ``torch.utils.data.DataLoader``. ``collate_fn`` defaults to
@@ -804,6 +862,47 @@ class RankPartitionedDataLoader:
 
         merged_kwargs = {**dataloader_kwargs, **per_dataset_kwargs[my_dataset_idx]}
         merged_kwargs.setdefault("collate_fn", custom_collate_fn)
+
+        # Map-style sharding: wrap datasets exposing ``__len__`` in a
+        # DistributedSampler so each rank in the dataset group sees a disjoint,
+        # equally-sized 1/N partition instead of replicating the full dataset.
+        # ``shuffle`` / ``sampler`` are popped because a sampler is mutually
+        # exclusive with them in ``torch.utils.data.DataLoader``.
+        #
+        # IterableDataset is explicitly excluded: such datasets shard themselves
+        # via ``shard_rank`` (e.g. SFTDataset) and PyTorch forbids pairing them
+        # with a sampler.  Note SFTDataset is an IterableDataset that *also*
+        # defines ``__len__``, so a plain ``hasattr(dataset, "__len__")`` test
+        # would misclassify it -- use an explicit isinstance check instead.
+        is_iterable_style = isinstance(dataset, torch.utils.data.IterableDataset)
+        is_map_style = (not is_iterable_style) and hasattr(dataset, "__len__")
+        shuffle = merged_kwargs.pop("shuffle", False)
+        merged_kwargs.pop("sampler", None)
+        drop_last = merged_kwargs.get("drop_last", False)
+        if shard_map_style_dataset and is_map_style and shard_world_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=shard_world_size,
+                rank=shard_rank,
+                shuffle=shuffle,
+                drop_last=drop_last,
+            )
+            # set_epoch is intentionally never called: a fixed epoch keeps the
+            # per-rank partition deterministic, which is required for safe
+            # interaction with infinite_data_stream (ranks rebuild iterators
+            # independently). See class docstring.
+            merged_kwargs["sampler"] = sampler
+            log.info(
+                f"RankPartitionedDataLoader: DistributedSampler for {names[my_dataset_idx]!r} "
+                f"(shard_rank={shard_rank}/{shard_world_size}, shuffle={shuffle}, "
+                f"drop_last={drop_last}, full_len={len(dataset)}, per_rank_len={len(sampler)})",
+                rank0_only=False,
+            )
+        elif shard_map_style_dataset and is_map_style:
+            # shard_world_size == 1: single rank owns the whole dataset; no
+            # sampler needed, but honor shuffle if requested.
+            merged_kwargs["shuffle"] = shuffle
+
         self.dataloader = torch.utils.data.DataLoader(dataset, **merged_kwargs)
         self.dataset_name = names[my_dataset_idx]
         self.dataset = dataset
@@ -839,6 +938,7 @@ class PackingDataLoader(JointDataLoader):
         lookahead_limit: int = JointDataLoader._DEFAULT_LOOKAHEAD_LIMIT,
         uniae_chunk_frames: int | Mapping[str, int] | None = None,
         uniae_pad_frames: int | None = None,
+        infinite_data_stream: bool = False,
     ):
         """
         Args:
@@ -870,6 +970,7 @@ class PackingDataLoader(JointDataLoader):
             lookahead_limits={dataset_name: int(lookahead_limit)},
             uniae_chunk_frames=uniae_chunk_frames,
             uniae_pad_frames=uniae_pad_frames,
+            infinite_data_stream=infinite_data_stream,
         )
 
     def __iter__(self):

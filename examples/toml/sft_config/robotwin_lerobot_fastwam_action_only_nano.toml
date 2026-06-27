@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+[job]
+task       = "vfm"
+experiment = "robotwin_lerobot_action_sft_nano"
+project    = "cosmos3"
+group      = "fastwam_action_only"
+name       = "robotwin_lerobot_fastwam_action_only_nano"
+wandb_mode = "disabled"
+
+[model]
+max_num_tokens_after_packing = 12288
+joint_attn_implementation    = "flex"
+precision                    = "bfloat16"
+wam_mode                     = "fastwam_action_only"
+
+[model.fastwam_action_only]
+enabled                                  = true
+action_horizon                           = 16
+action_dim                               = null
+control_fps                              = 15
+obs_frames                               = 1
+future_video_frames                      = 16
+action_loss_weight                       = 1.0
+video_aux_loss_weight                    = 1.0
+use_video_aux_loss                       = true
+use_action_loss                          = true
+inference_output                         = "action_only"
+disable_future_video_tokens_at_inference = true
+disable_video_decode_at_inference        = true
+save_debug_video                         = false
+action_denoising_steps                   = null
+execute_horizon                          = null
+strict_no_future_video_to_action         = true
+assert_attention_mask                    = true
+assert_no_video_decode_in_inference      = true
+allow_lambda_video_zero                  = true
+
+[model.ema]
+enabled         = true
+rate            = 0.1
+iteration_shift = 0
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 1
+context_parallel_shard_degree  = 1
+cfg_parallel_shard_degree      = 1
+
+[model.compile]
+enabled         = false
+compile_dynamic = true
+
+[model.activation_checkpointing]
+mode               = "full"
+save_ops_regex     = ["fmha"]
+preserve_rng_state = true
+determinism_check  = "default"
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[model.rectified_flow_training_config]
+action_loss_weight = 1.0
+loss_scale         = 1.0
+
+[optimizer]
+betas          = [0.9, 0.99]
+eps            = 1.0e-8
+fused          = true
+keys_to_select = ["moe_gen", "time_embedder", "vae2llm", "llm2vae", "action2llm", "llm2action", "action_modality_embed"]
+lr             = 2.0e-4
+optimizer_type = "FusedAdam"
+weight_decay   = 0.05
+
+[optimizer.lr_multipliers]
+action2llm            = 5.0
+llm2action            = 5.0
+action_modality_embed = 5.0
+
+[scheduler]
+cycle_lengths      = [10000]
+f_max              = [0.4]
+f_min              = [0.0]
+f_start            = [0.0]
+verbosity_interval = 0
+warm_up_steps      = [0]
+
+[trainer]
+distributed_parallelism = "fsdp"
+grad_accum_iter         = 1
+logging_iter            = 50
+max_iter                = 10000
+
+[trainer.callbacks.compile_tokenizer]
+compile_after_iterations = 3
+enabled                  = false
+
+[trainer.callbacks.grad_clip]
+clip_norm    = 1.0
+force_finite = true
+
+[checkpoint]
+keys_to_skip_loading = ["net_ema.", "action2llm", "llm2action", "action_modality_embed", "action_pos_embed"]
+load_path            = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter            = 1000
+strict_resume        = false
+
+[dataloader_train]
+max_samples_per_batch = 128
+
+[dataloader_train.dataloader.datasets.robotwin.dataset]
+wam_mode            = "fastwam_action_only"
+future_video_frames = 16
+action_horizon      = 16
+action_normalization = "quantile"

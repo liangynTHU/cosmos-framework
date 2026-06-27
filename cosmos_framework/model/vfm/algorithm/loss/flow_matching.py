@@ -82,6 +82,10 @@ def compute_flow_matching_loss(
             per_instance_losses.append((sqerr_i * noisy_mask_i).mean())  # []
 
         ts_i = timesteps[i, :T_i] if timesteps.dim() > 1 else timesteps[i]  # DF:[T_i]  TF:[1]
+        if ts_i.dim() > 0 and ts_i.numel() != T_i:
+            if T_i % ts_i.numel() != 0:
+                raise ValueError(f"Cannot align timestep length {ts_i.numel()} to loss length {T_i}")
+            ts_i = ts_i.repeat_interleave(T_i // ts_i.numel())
         tw_i = rectified_flow.train_time_weight(ts_i, tensor_kwargs_fp32)  # DF:[T_i]  TF:[1]
         tw_i = tw_i.reshape(-1, *([1] * (condition_mask[i].ndim - 1)))  # vision:[T_i,1,1]  action/sound:[T_i,1]
         if normalize_by_active:

@@ -96,6 +96,38 @@ def _normalize_rotation_matrices(rot_matrices: np.ndarray) -> np.ndarray:
     return normalized.astype(np.float32, copy=False).reshape(*original_shape, 3, 3)
 
 
+_ROTATION_NORM_EPS = 1e-8
+
+
+def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+    """Decode column-based 6D rotations with Zhou et al. Gram-Schmidt ``f_GS``.
+
+    The 6D input stores the first two *columns* of a rotation matrix
+    ``(a1, a2)``. Columns are recovered as:
+
+    * ``b1 = normalize(a1)``
+    * ``b2 = normalize(a2 - (b1 · a2) b1)``
+    * ``b3 = b1 × b2``
+
+    See Zhou et al., "On the Continuity of Rotation Representations in Neural
+    Networks", arXiv:1812.07035, Section B.
+    """
+
+    rot6d_flat = np.asarray(rot6d, dtype=np.float32).reshape(-1, 6)
+    a1 = rot6d_flat[:, :3]
+    a2 = rot6d_flat[:, 3:6]
+
+    b1_norm = np.linalg.norm(a1, axis=-1, keepdims=True)
+    b1 = a1 / np.maximum(b1_norm, _ROTATION_NORM_EPS)
+
+    u2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+    b2_norm = np.linalg.norm(u2, axis=-1, keepdims=True)
+    b2 = u2 / np.maximum(b2_norm, _ROTATION_NORM_EPS)
+
+    b3 = np.cross(b1, b2, axis=-1)
+    return np.stack((b1, b2, b3), axis=-1).astype(np.float32)
+
+
 def convert_rotation(
     rotation: torch.Tensor | np.ndarray,
     input_format: RotationConvention,
@@ -114,7 +146,8 @@ def convert_rotation(
         - ``euler_xyz``: Euler xyz angles in radians with shape ``(..., 3)``
         - ``quat_xyzw``: quaternions in SciPy's xyzw order with shape ``(..., 4)``
         - ``quat_wxyz``: quaternions in wxyz order with shape ``(..., 4)``
-        - ``rot6d``: column-based 6D representation with shape ``(..., 6)``
+        - ``rot6d``: column-based 6D representation with shape ``(..., 6)``.
+            Decoding uses Zhou et al. Gram-Schmidt (arXiv:1812.07035).
         - ``rot9d``: flattened rotation matrices with shape ``(..., 9)``
         - ``axisangle``: axis-angle vectors with shape ``(..., 3)``
 
@@ -134,7 +167,8 @@ def convert_rotation(
         output_format: Convention to return.
         normalize_matrix: Whether to project intermediate matrices to a valid
             rotation before returning. This is most useful when decoding from
-            approximate ``rot6d``/``rot9d`` inputs or non-unit quaternions.
+            approximate ``rot9d`` inputs or non-unit quaternions. For ``rot6d``,
+            decoding always applies Zhou et al. Gram-Schmidt and ignores this flag.
 
     Returns:
         Rotations with the same leading shape as the input, expressed in the
@@ -179,13 +213,7 @@ def convert_rotation(
         if rotation_np.ndim < 1 or rotation_np.shape[-1] != 6:
             raise ValueError(f"{input_format} rotation must have shape (..., 6), got {rotation_np.shape}")
         original_shape = rotation_np.shape[:-1]
-        rot6d_flat = rotation_np.reshape(-1, 6)
-        col0 = rot6d_flat[:, :3]
-        col1 = rot6d_flat[:, 3:]
-        col2 = np.cross(col0, col1, axis=-1)
-        matrices_flat = np.stack((col0, col1, col2), axis=-1).astype(np.float32)
-        if normalize_matrix:
-            matrices_flat = _normalize_rotation_matrices(matrices_flat).reshape(-1, 3, 3)
+        matrices_flat = _rot6d_to_matrix(rotation_np.reshape(-1, 6))
     elif input_format == "rot9d":
         if rotation_np.ndim < 1 or rotation_np.shape[-1] != 9:
             raise ValueError(f"rot9d rotation must have shape (..., 9), got {rotation_np.shape}")
@@ -555,10 +583,9 @@ def _rotation_angle_per_arm(rotations: np.ndarray, rotation_format: str) -> np.n
     shape ``(T, n_arms)``. The angle is rotation-format aware so a fixed
     ``eps_r`` threshold has consistent geometric meaning across formats:
 
-    - ``rot6d``  → reconstruct ``trace(R)`` in closed form from the two stored
-      columns ``a, b`` (already unit-orthogonal as they came from a valid
-      rotation matrix). The third column is ``a × b``, so
-      ``trace(R) = a[0] + b[1] + a[0]·b[1] - a[1]·b[0]``.
+    - ``rot6d``  → reconstruct ``trace(R)`` from the Gram-Schmidt columns
+      ``b1, b2`` (third column ``b3 = b1 × b2``), so
+      ``trace(R) = b1[0] + b2[1] + b1[0]·b2[1] - b1[1]·b2[0]``.
       ``angle = arccos(clip((trace - 1) / 2, -1, 1))``.
     - ``rot9d``  → reshape to ``(..., 3, 3)`` and use
       ``trace(R) = R[0,0] + R[1,1] + R[2,2]``.

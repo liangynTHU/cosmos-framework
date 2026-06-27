@@ -81,6 +81,52 @@ def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int
     return target_w, target_h
 
 
+def _reflection_pad_tensor_to_target(
+    tensor: torch.Tensor,
+    keep_aspect_ratio: bool,
+    target_w: int,
+    target_h: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resize and pad a single image/video tensor to the requested target size."""
+    if tensor.ndim not in (3, 4):
+        raise ValueError(f"Unexpected tensor ndim={tensor.ndim}, expected 3 or 4")
+
+    orig_h, orig_w = tensor.shape[-2:]
+
+    if keep_aspect_ratio:
+        scaling_ratio = min(target_w / orig_w, target_h / orig_h, 1.0)
+        orig_h_resized = int(scaling_ratio * orig_h + 0.5)
+        orig_w_resized = int(scaling_ratio * orig_w + 0.5)
+        assert orig_h_resized <= target_h and orig_w_resized <= target_w, (
+            f"Resize error: orig ({orig_h}, {orig_w}) target ({target_h}, {target_w}) "
+            f"computed ({orig_h_resized}, {orig_w_resized})"
+        )
+    else:
+        orig_h_resized = target_h
+        orig_w_resized = target_w
+
+    if orig_h_resized != orig_h or orig_w_resized != orig_w:
+        tensor = transforms_F.resize(
+            tensor,
+            size=[orig_h_resized, orig_w_resized],
+            interpolation=transforms_F.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+
+    if orig_w_resized != target_w or orig_h_resized != target_h:
+        padding_right = target_w - orig_w_resized
+        padding_bottom = target_h - orig_h_resized
+        padding = [0, 0, padding_right, padding_bottom]
+
+        if padding_right >= orig_w_resized or padding_bottom >= orig_h_resized:
+            tensor = transforms_F.pad(tensor, padding, padding_mode="edge")
+        else:
+            tensor = transforms_F.pad(tensor, padding, padding_mode="reflect")
+
+    image_size = torch.tensor([target_h, target_w, orig_h_resized, orig_w_resized], dtype=torch.float)
+    return tensor, image_size
+
+
 def reflection_pad_to_target(
     data_dict: dict,
     keys: list[str],
@@ -121,66 +167,53 @@ def reflection_pad_to_target(
     Returns:
         The mutated *data_dict*.
     """
-    orig_h_resized: int = 0
-    orig_w_resized: int = 0
+    image_sizes: list[torch.Tensor] = []
 
     for key in keys:
         if key not in data_dict:
             continue
-        tensor = data_dict[key]
-        if not isinstance(tensor, torch.Tensor):
+        value = data_dict[key]
+        if isinstance(value, list):
+            padded_items: list[torch.Tensor] = []
+            item_sizes: list[torch.Tensor] = []
+            for tensor in value:
+                if not isinstance(tensor, torch.Tensor):
+                    raise ValueError(f"Expected every item in key '{key}' to be a tensor, got {type(tensor).__name__}")
+                padded_tensor, image_size = _reflection_pad_tensor_to_target(
+                    tensor,
+                    keep_aspect_ratio,
+                    target_w,
+                    target_h,
+                )
+                padded_items.append(padded_tensor)
+                item_sizes.append(image_size)
+            data_dict[key] = padded_items
+            if key == "video":
+                image_sizes = item_sizes
             continue
 
-        # Extract spatial dims
-        if tensor.ndim == 3:
-            orig_h, orig_w = tensor.shape[-2:]
-        elif tensor.ndim == 4:
-            orig_h, orig_w = tensor.shape[-2:]
-        else:
-            raise ValueError(f"Unexpected tensor ndim={tensor.ndim} for key '{key}', expected 3 or 4")
+        if not isinstance(value, torch.Tensor):
+            continue
 
-        # Step 1: aspect-preserving resize to fit within (target_h, target_w)
-        if keep_aspect_ratio:
-            # Prevent upscaling the video by setting the upper bound of scaling_ratio to 1.0.
-            scaling_ratio = min(target_w / orig_w, target_h / orig_h, 1.0)
-            orig_h_resized = int(scaling_ratio * orig_h + 0.5)
-            orig_w_resized = int(scaling_ratio * orig_w + 0.5)
-            assert orig_h_resized <= target_h and orig_w_resized <= target_w, (
-                f"Resize error: orig ({orig_h}, {orig_w}) target ({target_h}, {target_w}) "
-                f"computed ({orig_h_resized}, {orig_w_resized})"
-            )
-        else:
-            orig_h_resized = target_h
-            orig_w_resized = target_w
+        padded_tensor, image_size = _reflection_pad_tensor_to_target(
+            value,
+            keep_aspect_ratio,
+            target_w,
+            target_h,
+        )
+        data_dict[key] = padded_tensor
+        if key == "video":
+            image_sizes = [image_size]
 
-        if orig_h_resized != orig_h or orig_w_resized != orig_w:
-            tensor = transforms_F.resize(
-                tensor,
-                size=[orig_h_resized, orig_w_resized],
-                interpolation=transforms_F.InterpolationMode.BICUBIC,
-                antialias=True,
-            )
-
-        # Step 2: padding to exact target size (bottom and right only)
-        if orig_w_resized != target_w or orig_h_resized != target_h:
-            padding_right = target_w - orig_w_resized
-            padding_bottom = target_h - orig_h_resized
-            padding = [0, 0, padding_right, padding_bottom]
-
-            if padding_right >= orig_w_resized or padding_bottom >= orig_h_resized:
-                tensor = transforms_F.pad(tensor, padding, padding_mode="edge")
-            else:
-                tensor = transforms_F.pad(tensor, padding, padding_mode="reflect")
-
-        data_dict[key] = tensor
-
-    # image_size: shape (4,) — [target_h, target_w, orig_h_resized, orig_w_resized].
-    # Matches VFM's item_dataset convention.  default_collate stacks to (B, 4);
-    # IterativeJointDataLoader._get_next_sample slices to (1, 4) per sample so
-    # the model can index [i][0][0].
-    data_dict["image_size"] = torch.tensor(
-        [target_h, target_w, orig_h_resized, orig_w_resized], dtype=torch.float
-    )  # [4]
+    # image_size: shape (4,) for standard single-video samples, or list[(4,)]
+    # for multi-image samples.  The latter is flattened by the joint dataloader
+    # so each encoded vision item can remove its own padding.
+    if len(image_sizes) == 1:
+        data_dict["image_size"] = image_sizes[0]
+    elif len(image_sizes) > 1:
+        data_dict["image_size"] = image_sizes
+    else:
+        data_dict["image_size"] = torch.tensor([target_h, target_w, target_h, target_w], dtype=torch.float)
 
     return data_dict
 
@@ -301,6 +334,8 @@ def build_sequence_plan_from_mode(
     # forward_dynamics: all action steps are clean (conditioning)
     # inverse_dynamics/policy: action is supervised (predicted)
     # History frames (prepended) are always conditioning.
+    condition_frame_indexes_action: list[int] = []
+    action_start_frame_offset = 1 - num_history_actions
     base_action_length = action_length - num_history_actions
     if mode == "forward_dynamics":
         condition_frame_indexes_action = list(range(action_length))
@@ -364,8 +399,12 @@ class VideoResize:
             ``"image_size"`` entry.
         """
         video = data_dict.get("video")
-        assert isinstance(video, torch.Tensor), "video is required for reflection padding"
-        h, w = video.shape[-2:]
+        if isinstance(video, list):
+            assert len(video) > 0 and isinstance(video[0], torch.Tensor), "video list must contain tensors"
+            h, w = video[0].shape[-2:]
+        else:
+            assert isinstance(video, torch.Tensor), "video is required for reflection padding"
+            h, w = video.shape[-2:]
 
         if resolution is None:
             resolution = get_vision_data_resolution((h, w))
@@ -476,6 +515,7 @@ class ActionTransformPipeline:
         append_idle_frames: bool = False,
         idle_frames_dropout: float = 0.05,
         format_prompt_as_json: bool = False,
+        add_camera_tokens: bool = False,
     ) -> None:
         self.caption_key: str = caption_key
         self.video_temporal_downsample: int = video_temporal_downsample
@@ -552,6 +592,7 @@ class ActionTransformPipeline:
                 args={
                     "tokenizer_config": tokenizer_config,
                     "cfg_dropout_rate": cfg_dropout_rate,
+                    "add_camera_tokens": add_camera_tokens,
                 },
             )
 
@@ -604,6 +645,22 @@ class ActionTransformPipeline:
         # 1. Resize + reflection-pad spatial dimensions to the closest predefined target from ``VIDEO_RES_SIZE_INFO[resolution]``.
         data_dict = self.video_resize(data_dict, resolution)
 
+        video = data_dict.get("video")
+        multi_image_sizes = data_dict.get("image_size") if isinstance(video, list) else None
+        prompt_video = video[0] if isinstance(video, list) else video
+        prompt_image_size = data_dict.get("image_size")
+        if isinstance(prompt_image_size, list):
+            prompt_image_size = prompt_image_size[0]
+
+        # Existing prompt augmentors expect a single video tensor. For multi-image
+        # samples, all camera streams are frame-aligned and padded to the same target
+        # canvas, so using the first stream for duration/resolution metadata keeps the
+        # original prompt pipeline unchanged while preserving multi-vision inputs.
+        if isinstance(video, list):
+            data_dict["video"] = prompt_video
+        if prompt_image_size is not None:
+            data_dict["image_size"] = prompt_image_size
+
         # 2. Format the caption as structured JSON when requested; otherwise run the legacy string appenders.
         if self.prompt_json_formatter is not None:
             data_dict = self.prompt_json_formatter(data_dict)
@@ -636,11 +693,19 @@ class ActionTransformPipeline:
         if self.text_tokenizer is not None:
             data_dict = self.text_tokenizer(data_dict)
 
+        if isinstance(video, list):
+            data_dict["video"] = video
+            if isinstance(multi_image_sizes, list):
+                # Restore the per-camera sizes saved by reflection_pad_to_target.
+                # ``prompt_image_size`` above is intentionally only for text metadata.
+                data_dict["image_size"] = multi_image_sizes
+
         # 8. Build a ``SequencePlan`` from the ``"mode"`` key (if present).
         video = data_dict.get("video")
         action = data_dict.get("action")
         assert video is not None, "video is required"
-        video_length = video.shape[1]  # [C,T,H,W] -> T
+        first_video = video[0] if isinstance(video, list) else video
+        video_length = first_video.shape[1]  # [C,T,H,W] -> T
         action_length = action.shape[0] if isinstance(action, torch.Tensor) else max(video_length - 1, 0)
 
         # Prepend history action frames (ground-truth conditioning) if present.
@@ -658,6 +723,30 @@ class ActionTransformPipeline:
             video_temporal_downsample=self.video_temporal_downsample,
             num_history_actions=num_history_actions,
         )
+        if data_dict.get("fastwam_action_only") or data_dict.get("wam_mode") == "fastwam_action_only":
+            sequence_plan.fastwam_action_only = True
+            action_valid_mask = data_dict.get("action_valid_mask")
+            if isinstance(action_valid_mask, torch.Tensor):
+                invalid_action_steps = torch.nonzero(~action_valid_mask.bool(), as_tuple=False).flatten().tolist()
+                sequence_plan.condition_frame_indexes_action = sorted(
+                    set(sequence_plan.condition_frame_indexes_action).union(
+                        num_history_actions + int(i) for i in invalid_action_steps
+                    )
+                )
+            future_video_valid_mask = data_dict.get("future_video_valid_mask")
+            if isinstance(future_video_valid_mask, torch.Tensor):
+                valid_with_obs = torch.cat(
+                    [torch.ones(1, dtype=torch.bool, device=future_video_valid_mask.device), future_video_valid_mask.bool()]
+                )
+                invalid_latent_frames = []
+                for latent_idx in range(video_length):
+                    raw_start = latent_idx * self.video_temporal_downsample
+                    raw_end = min(raw_start + self.video_temporal_downsample, valid_with_obs.numel())
+                    if raw_start >= valid_with_obs.numel() or not bool(valid_with_obs[raw_start:raw_end].any()):
+                        invalid_latent_frames.append(latent_idx)
+                sequence_plan.condition_frame_indexes_vision = sorted(
+                    set(sequence_plan.condition_frame_indexes_vision).union(invalid_latent_frames)
+                )
         data_dict["sequence_plan"] = sequence_plan
 
         if sequence_plan.has_action:

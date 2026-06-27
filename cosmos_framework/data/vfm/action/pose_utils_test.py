@@ -8,6 +8,7 @@ from scipy.spatial.transform import Rotation as R
 
 from cosmos_framework.data.vfm.action.pose_utils import (
     _normalize_rotation_matrices,
+    _rot6d_to_matrix,
     _to_numpy_float32,
     build_abs_pose_from_components,
     convert_rotation,
@@ -154,6 +155,29 @@ def test_convert_rotation_rot6d_to_matrix_uses_column_based_action_convention() 
 
     np.testing.assert_allclose(reconstructed, matrices_np, atol=1e-6)
 
+
+@pytest.mark.L0
+def test_rot6d_decode_uses_zhou_gram_schmidt() -> None:
+    """Noisy 6D inputs should be orthonormalized via Gram-Schmidt, not raw cross."""
+    euler = np.array([[0.2, -0.3, 0.5]], dtype=np.float32)
+    matrix = R.from_euler("xyz", euler).as_matrix().astype(np.float32)
+    rot6d = matrix[:, :, :2].transpose(0, 2, 1).reshape(1, 6)
+    noisy_rot6d = rot6d + np.array([[0.05, -0.02, 0.01, 0.03, -0.04, 0.02]], dtype=np.float32)
+
+    reconstructed = _rot6d_to_matrix(noisy_rot6d)[0]
+    identity = reconstructed.T @ reconstructed
+    np.testing.assert_allclose(identity, np.eye(3, dtype=np.float32), atol=1e-5)
+    np.testing.assert_allclose(np.linalg.det(reconstructed), 1.0, atol=1e-5)
+
+    raw_cross = np.stack(
+        (
+            noisy_rot6d[0, :3],
+            noisy_rot6d[0, 3:6],
+            np.cross(noisy_rot6d[0, :3], noisy_rot6d[0, 3:6]),
+        ),
+        axis=-1,
+    )
+    assert not np.allclose(raw_cross, reconstructed, atol=1e-3)
 
 @pytest.mark.L0
 def test_normalize_rotation_matrices_batched_matches_reference_loop() -> None:

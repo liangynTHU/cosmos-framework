@@ -58,13 +58,34 @@ MAX_FULL_LEN_IMAGE_BATCH = 0
 MAX_CAUSAL_LEN_VIDEO_BATCH = 0
 MAX_FULL_LEN_VIDEO_BATCH = 0
 
+TOKEN_GROUP_AR_TEXT = "ar_text"
+TOKEN_GROUP_OBS_CLEAN_VIDEO = "obs_clean_video"
+TOKEN_GROUP_FUTURE_NOISY_VIDEO = "future_noisy_video"
+TOKEN_GROUP_NOISY_ACTION = "noisy_action"
+TOKEN_GROUP_OTHER = "other"
+
+_FASTWAM_TOKEN_GROUP_TO_ID = {
+    TOKEN_GROUP_AR_TEXT: 1,
+    TOKEN_GROUP_OBS_CLEAN_VIDEO: 2,
+    TOKEN_GROUP_FUTURE_NOISY_VIDEO: 3,
+    TOKEN_GROUP_NOISY_ACTION: 4,
+    TOKEN_GROUP_OTHER: 5,
+}
+FASTWAM_TOKEN_GROUP_IDS = dict(_FASTWAM_TOKEN_GROUP_TO_ID)
+
 
 # ============================================================================
 # Attention mask creation
 # ============================================================================
 
 
-def create_sparse_mask(document_lens, split_lens, attn_modes, device):
+def _as_device_tensor(values, device, dtype=torch.long):
+    if isinstance(values, torch.Tensor):
+        return values.to(device=device, dtype=dtype)
+    return torch.tensor(values, device=device, dtype=dtype)
+
+
+def create_sparse_mask(document_lens, split_lens, attn_modes, device, fastwam_token_group_ids=None):
     """Create a sparse attention mask combining multiple attention patterns.
 
     Args:
@@ -72,6 +93,8 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
         split_lens: List of split lengths within documents
         attn_modes: List of attention modes ('causal', 'full', 'noise') for each split
         device: Device to place tensors on
+        fastwam_token_group_ids: Optional per-token group ids for FastWAM action-only flex attention.
+            When provided, noisy action queries are explicitly prevented from attending to future-video keys.
 
     Returns:
         Combined mask using flex attention API
@@ -111,8 +134,60 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
         """Ensure attention stays within same document/sample."""
         return document_id[q_idx] == document_id[kv_idx]
 
-    # Combine all masks: (causal OR full_and_noise) AND remove_noise AND sample
-    return and_masks(or_masks(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
+    base_mask = and_masks(or_masks(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
+    if fastwam_token_group_ids is None:
+        return base_mask
+
+    token_group_id = _as_device_tensor(fastwam_token_group_ids, device=device)
+    action_group = _FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_NOISY_ACTION]
+    future_group = _FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_FUTURE_NOISY_VIDEO]
+
+    def fastwam_no_future_video_to_action_mask(b, h, q_idx, kv_idx):
+        """FastWAM safety mask: action queries must not read future-video keys."""
+        return ~((token_group_id[q_idx] == action_group) & (token_group_id[kv_idx] == future_group))
+
+    return and_masks(base_mask, fastwam_no_future_video_to_action_mask)
+
+
+def build_fastwam_action_only_attention_mask(token_group_ids, is_training: bool, device="cpu") -> torch.Tensor:
+    """Build a dense bool attention mask for FastWAM-style action-only sanity checks.
+
+    The returned mask uses True=can attend and False=masked. Training may include
+    future-video tokens, but noisy action queries are always blocked from attending to
+    future-video keys. Inference should not include future-video tokens at all.
+    """
+    token_group_id = _as_device_tensor(token_group_ids, device=device)
+    seq_len = int(token_group_id.numel())
+    mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=token_group_id.device)
+    action_group = _FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_NOISY_ACTION]
+    future_group = _FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_FUTURE_NOISY_VIDEO]
+    action_idx = token_group_id == action_group
+    future_idx = token_group_id == future_group
+    if not is_training and future_idx.any():
+        raise AssertionError("FastWAM inference mask must not contain future video tokens.")
+    if action_idx.any() and future_idx.any():
+        action_positions = torch.nonzero(action_idx, as_tuple=False).flatten()
+        future_positions = torch.nonzero(future_idx, as_tuple=False).flatten()
+        mask[action_positions[:, None], future_positions[None, :]] = False
+    return mask
+
+
+def assert_fastwam_no_future_video_to_action(token_group_ids, attention_mask: torch.Tensor | None = None) -> None:
+    """Assert FastWAM action queries cannot attend to future-video keys."""
+    token_group_id = token_group_ids if isinstance(token_group_ids, torch.Tensor) else torch.tensor(token_group_ids)
+    action_group = _FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_NOISY_ACTION]
+    future_group = _FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_FUTURE_NOISY_VIDEO]
+    action_idx = token_group_id == action_group
+    future_idx = token_group_id == future_group
+    if not action_idx.any() or not future_idx.any():
+        return
+    if attention_mask is None:
+        attention_mask = build_fastwam_action_only_attention_mask(token_group_id, is_training=True)
+    submask = attention_mask[action_idx][:, future_idx]
+    if attention_mask.dtype == torch.bool:
+        assert not submask.any(), "FastWAM leakage: action tokens can attend to future video tokens."
+    else:
+        assert torch.isneginf(submask).all(), "FastWAM leakage: action tokens can attend to future video tokens."
 
 
 def prepare_attention_mask_per_sample(split_lens, attn_modes, device="cpu"):
@@ -179,39 +254,60 @@ def prepare_attention_mask_per_sample(split_lens, attn_modes, device="cpu"):
 # ============================================================================
 
 
-def add_special_tokens(tokenizer):
-    """Add image-related special tokens to tokenizer if not already present.
+def add_special_tokens(tokenizer, *, add_camera_tokens: bool = False):
+    """Add Cosmos3 special tokens to tokenizer if not already present.
 
     Args:
-        tokenizer: Tokenizer to add special tokens to
+        tokenizer: Tokenizer to add special tokens to.
+        add_camera_tokens: Whether to add RoboTwin multi-image camera markers.
+            Keep this disabled for legacy concat runs so their tokenizer/model
+            vocabulary stays exactly unchanged.
 
     Returns:
-        Tuple of (modified tokenizer, dict of new token IDs)
+        Tuple of (modified tokenizer, dict of special token IDs)
     """
-    # Collect existing special tokens
+    # Collect existing special tokens and full vocabulary tokens. Some Qwen
+    # tokenizer snapshots include extra tokens in the normal vocabulary instead
+    # of ``special_tokens_map``; checking both avoids duplicate additions.
     existing_special_tokens = []
     for key, value in tokenizer.special_tokens_map.items():
         if isinstance(value, str):
             existing_special_tokens.append(value)
         elif isinstance(value, list):
             existing_special_tokens.extend(value)
+    existing_tokens = set(existing_special_tokens)
+    existing_vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
 
-    # Define image boundary tokens to add if missing
-    tokens_to_add = []
-    if "<|vision_start|>" not in existing_special_tokens:
-        tokens_to_add.append("<|vision_start|>")
-    if "<|vision_end|>" not in existing_special_tokens:
-        tokens_to_add.append("<|vision_end|>")
-
-    # Add new tokens to tokenizer vocabulary
-    if tokens_to_add:
-        tokenizer.add_tokens(tokens_to_add)
-
-    # Get token IDs for image boundary tokens
-    new_token_ids = {
-        "start_of_generation": tokenizer.convert_tokens_to_ids("<|vision_start|>"),
-        "end_of_generation": tokenizer.convert_tokens_to_ids("<|vision_end|>"),
+    generation_token_names = {
+        "start_of_generation": "<|vision_start|>",
+        "end_of_generation": "<|vision_end|>",
     }
+    camera_token_names = {
+        "camera_high": "<cam_high>",
+        "camera_left_wrist": "<cam_left_wrist>",
+        "camera_right_wrist": "<cam_right_wrist>",
+    }
+
+    generation_tokens_to_add = [
+        token
+        for token in generation_token_names.values()
+        if token not in existing_tokens and token not in existing_vocab
+    ]
+    if generation_tokens_to_add:
+        tokenizer.add_tokens(generation_tokens_to_add)
+
+    special_token_names = dict(generation_token_names)
+    if add_camera_tokens:
+        camera_tokens_to_add = [
+            token
+            for token in camera_token_names.values()
+            if token not in existing_tokens and token not in existing_vocab
+        ]
+        if camera_tokens_to_add:
+            tokenizer.add_special_tokens({"additional_special_tokens": camera_tokens_to_add})
+        special_token_names.update(camera_token_names)
+
+    new_token_ids = {name: tokenizer.convert_tokens_to_ids(token) for name, token in special_token_names.items()}
 
     return tokenizer, new_token_ids
 
@@ -327,6 +423,8 @@ class PackedSequence:
     text_ids: list[int] | torch.Tensor = field(default_factory=list)
     text_indexes: list[int] | torch.Tensor = field(default_factory=list)
     position_ids: list[int] | torch.Tensor = field(default_factory=list)
+    token_group_ids: list[int] | torch.Tensor | None = field(default_factory=list)
+    fastwam_action_only: bool = False
 
     # Loss computation - Cross Entropy (text)
     label_ids: list[int] | torch.Tensor | None = field(default_factory=list)
@@ -447,6 +545,16 @@ class PackedSequence:
         else:  # Original 1D RoPE from Bagel, where all the media tokens share the same 1D position ID
             position_ids = torch.tensor(self.position_ids)  # [seq_len]
 
+        token_group_ids: torch.Tensor | None = None
+        if self.fastwam_action_only:
+            assert isinstance(self.token_group_ids, list)
+            if len(self.token_group_ids) != sequence_length:
+                raise ValueError(
+                    "FastWAM token_group_ids length must match packed sequence length: "
+                    f"{len(self.token_group_ids)} != {sequence_length}."
+                )
+            token_group_ids = torch.tensor(self.token_group_ids, dtype=torch.long)
+
         return PackedSequence(
             # Sequence structure
             sequence_length=sequence_length,
@@ -458,6 +566,8 @@ class PackedSequence:
             text_ids=torch.tensor(self.text_ids, dtype=torch.long),  # [N_text_tokens]
             text_indexes=torch.tensor(self.text_indexes, dtype=torch.long),  # [N_text_tokens]
             position_ids=position_ids,  # [seq_len] or [3,seq_len]
+            token_group_ids=token_group_ids,
+            fastwam_action_only=self.fastwam_action_only,
             # Loss computation - Cross Entropy
             label_ids=label_ids,
             ce_loss_indexes=ce_loss_indexes,
@@ -479,6 +589,8 @@ class PackedSequence:
             self.text_indexes = self.text_indexes.cuda()
         if isinstance(self.position_ids, torch.Tensor):
             self.position_ids = self.position_ids.cuda()
+        if isinstance(self.token_group_ids, torch.Tensor):
+            self.token_group_ids = self.token_group_ids.cuda()
         if isinstance(self.label_ids, torch.Tensor):
             self.label_ids = self.label_ids.cuda()
         if isinstance(self.ce_loss_indexes, torch.Tensor):
@@ -544,6 +656,9 @@ class SequencePlan:
     has_sound: bool = False
     condition_frame_indexes_sound: list[int] = field(default_factory=list)
 
+    # -- FastWAM-style action-only mode metadata --
+    fastwam_action_only: bool = False
+
     def as_dict(self) -> dict:
         return {
             "has_text": self.has_text,
@@ -554,6 +669,7 @@ class SequencePlan:
             "condition_frame_indexes_action": self.condition_frame_indexes_action,
             "condition_frame_indexes_sound": self.condition_frame_indexes_sound,
             "share_vision_temporal_positions": self.share_vision_temporal_positions,
+            "fastwam_action_only": self.fastwam_action_only,
         }
 
 
@@ -667,6 +783,9 @@ def _pack_text_tokens(
         packed_seq.position_ids.append(text_mrope_ids)
     else:
         packed_seq.position_ids.extend(range(curr_rope_id, curr_rope_id + split_len))
+    if packed_seq.fastwam_action_only:
+        assert isinstance(packed_seq.token_group_ids, list)
+        packed_seq.token_group_ids.extend([_FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_AR_TEXT]] * split_len)
     packed_seq.attn_modes.append("causal")
     packed_seq.split_lens.append(split_len)
 
@@ -739,6 +858,12 @@ def _pack_vision_tokens(
 
     # Supervise vision tokens based on conditioning frames
     condition_set = {idx for idx in condition_frame_indexes_vision if 0 <= idx < latent_t}
+    if packed_seq.fastwam_action_only:
+        assert isinstance(packed_seq.token_group_ids, list)
+        frame_token_stride_for_groups = patch_h * patch_w
+        for frame_idx in range(latent_t):
+            group_name = TOKEN_GROUP_OBS_CLEAN_VIDEO if frame_idx in condition_set else TOKEN_GROUP_FUTURE_NOISY_VIDEO
+            packed_seq.token_group_ids.extend([_FASTWAM_TOKEN_GROUP_TO_ID[group_name]] * frame_token_stride_for_groups)
     assert isinstance(packed_seq.vision.condition_mask, list)
 
     vision_condition_mask = torch.zeros(
@@ -858,6 +983,11 @@ def _pack_action_tokens(
     packed_seq.action.tokens.append(input_action_tokens)
 
     condition_set = {idx for idx in condition_frame_indexes_action if 0 <= idx < action_split_len}
+    if packed_seq.fastwam_action_only:
+        assert isinstance(packed_seq.token_group_ids, list)
+        for frame_idx in range(action_split_len):
+            group_name = TOKEN_GROUP_OTHER if frame_idx in condition_set else TOKEN_GROUP_NOISY_ACTION
+            packed_seq.token_group_ids.append(_FASTWAM_TOKEN_GROUP_TO_ID[group_name])
     assert isinstance(packed_seq.action.condition_mask, list)
 
     action_condition_mask = torch.zeros(
@@ -1036,6 +1166,7 @@ def _pack_supertokens_temporal_causal(
     input_vision_tokens: torch.Tensor,
     input_action_tokens: torch.Tensor | None,
     condition_frame_indexes_vision: list[int],
+    condition_frame_indexes_action: list[int],
     input_timestep: float | torch.Tensor,
     curr_rope_id: int,
     latent_patch_size: int,
@@ -1108,6 +1239,7 @@ def _pack_supertokens_temporal_causal(
     dtype = input_vision_tokens.dtype
 
     null_action_flag: bool
+    condition_set_action: set[int] = set()
     if pack_action_tokens:
         # Build all_action_tokens: shape (latent_t * tcf, action_dim)
         #
@@ -1177,10 +1309,23 @@ def _pack_supertokens_temporal_causal(
         packed_seq.action.token_shapes.append((latent_t * tcf,))
         packed_seq.action.tokens.append(all_action_tokens)
 
-        # Action conditioning mask: all action tokens are conditioning (not supervised)
-        # Null tokens are always conditioning; real actions are conditioning too (they are inputs)
-        action_condition_mask = torch.ones((latent_t * tcf, 1), device=device, dtype=dtype)  # [T*tcf,1]
+        # Action conditioning mask: 1 = clean/conditioning, 0 = noisy/supervised.
+        # In the temporal-causal layout action indexes are per action token, not per latent frame.
+        condition_set_action = {idx for idx in condition_frame_indexes_action if 0 <= idx < latent_t * tcf}
+        if null_action_flag:
+            # The prepended null action tokens are structural conditioning tokens and should not be predicted.
+            condition_set_action.update(range(tcf))
+        action_condition_mask = torch.zeros((latent_t * tcf, 1), device=device, dtype=dtype)  # [T*tcf,1]
+        for aidx in condition_set_action:
+            action_condition_mask[aidx, 0] = 1.0
         packed_seq.action.condition_mask.append(action_condition_mask)
+
+        action_noisy_frame_indexes = torch.tensor(
+            [idx for idx in range(latent_t * tcf) if idx not in condition_set_action],
+            device=device,
+            dtype=torch.long,
+        )  # [N_noisy_action_tokens]
+        packed_seq.action.noisy_frame_indexes.append(action_noisy_frame_indexes)
 
     # Pack in interleaved supertoken order: [action_t, vision_t] for each frame t
     # (or just [vision_t] per frame when pack_action_tokens=False)
@@ -1283,7 +1428,14 @@ def _pack_supertokens_temporal_causal(
             # Pack action tokens for this frame (indexes only; tokens already stored in packed_seq.action.tokens)
             action_indexes = list(range(curr, curr + tcf))
             packed_seq.action.sequence_indexes.extend(action_indexes)
-            # Action tokens are never in MSE loss (always conditioning)
+            for local_action_idx, packed_action_idx in enumerate(action_indexes, start=frame_t * tcf):
+                if local_action_idx not in condition_set_action:
+                    packed_seq.action.mse_loss_indexes.append(packed_action_idx)
+                    if isinstance(input_timestep, torch.Tensor):
+                        frame_ts = input_timestep[frame_t].item()
+                    else:
+                        frame_ts = input_timestep
+                    packed_seq.action.timesteps.append(frame_ts)
             curr += tcf
             total_split_len += tcf
 
@@ -1335,6 +1487,7 @@ def pack_input_sequence(
     video_temporal_causal: bool = False,
     action_dim: int = 32,
     initial_mrope_temporal_offset: int | float = 0,
+    fastwam_action_only: bool = False,
 ) -> PackedSequence:
     """
     Pack a sequence of input strings and VAE latents into a packed tensor format.
@@ -1428,6 +1581,7 @@ def pack_input_sequence(
 
     # Initialize packed sequence (acts as builder during packing)
     packed_seq = PackedSequence()
+    packed_seq.fastwam_action_only = bool(fastwam_action_only or any(plan.fastwam_action_only for plan in sequence_plans))
 
     # Configure 3D mRoPE on the builder (enabled when position_embedding_type is unified_3d_mrope)
     packed_seq._use_mrope = position_embedding_type == "unified_3d_mrope"
@@ -1515,6 +1669,7 @@ def pack_input_sequence(
                 input_vision_tokens=input_vision_tokens,
                 input_action_tokens=input_action_tokens_tc,
                 condition_frame_indexes_vision=sequence_plan.condition_frame_indexes_vision,
+                condition_frame_indexes_action=sequence_plan.condition_frame_indexes_action,
                 input_timestep=input_timestep,
                 curr_rope_id=curr_rope_id,
                 latent_patch_size=latent_patch_size,
@@ -1741,6 +1896,10 @@ def pack_input_sequence(
             else:
                 packed_seq.position_ids.append(curr_rope_id)  # type: ignore[arg-type]
 
+            if packed_seq.fastwam_action_only:
+                assert isinstance(packed_seq.token_group_ids, list)
+                packed_seq.token_group_ids.append(_FASTWAM_TOKEN_GROUP_TO_ID[TOKEN_GROUP_AR_TEXT])
+
             packed_seq.curr += 1
             eov_len = 1
             sample_len += 1
@@ -1762,6 +1921,17 @@ def pack_input_sequence(
     return packed_seq.finalize(
         gen_data_clean=gen_data_clean,
     )
+
+
+def pack_tokens_fastwam_action_only(*args, **kwargs) -> PackedSequence:
+    """Pack FastWAM-style Cosmos3 training/inference tokens.
+
+    This is a thin explicit wrapper over the existing Cosmos3 packer. It preserves
+    the standard policy layout, adds FastWAM token-group metadata, and lets the flex
+    attention builder mask action queries from future-video keys.
+    """
+    kwargs["fastwam_action_only"] = True
+    return pack_input_sequence(*args, **kwargs)
 
 
 # ============================================================================

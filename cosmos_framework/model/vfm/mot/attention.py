@@ -344,6 +344,7 @@ def build_packed_sequence(
     num_action_tokens_per_supertoken: int = 0,
     null_action_supertokens: bool = False,
     pad_for_cuda_graphs: bool = False,
+    fastwam_token_group_ids: torch.Tensor | None = None,
 ) -> tuple[FactoredSequencePack | JointSequencePack, AttentionMaskType, list | None]:
     """
     Build the model input pack and attention meta for joint attention.
@@ -352,7 +353,13 @@ def build_packed_sequence(
     device = packed_sequence.device
     natten_metadata_list = None
     if joint_attn_implementation == "flex":
-        sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
+        sparse_mask = create_sparse_mask(
+            sample_lens,
+            split_lens,
+            attn_modes,
+            device,
+            fastwam_token_group_ids=fastwam_token_group_ids,
+        )
         seqlen = sum(sample_lens)
         attention_meta = create_block_mask(
             sparse_mask,
