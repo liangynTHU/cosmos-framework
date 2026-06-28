@@ -63,6 +63,11 @@ from PIL import Image
 # Action-specific helpers live in the in-tree project tree. Imports stay as
 # `projects.cosmos3.vfm.*` and are auto-rewritten to `cosmos3._src.vfm.*` by the
 # cosmos-framework release script.
+from cosmos_framework.data.vfm.action.action_processing import (
+    ActionProcessingRecord,
+    has_split_state_action_stats,
+    make_batched_action_processing_fields,
+)
 from cosmos_framework.data.vfm.action.domain_utils import get_domain_id
 from cosmos_framework.data.vfm.action.transforms import (
     build_sequence_plan_from_mode,
@@ -307,6 +312,7 @@ def _save_policy_request_dump(
     pred_action: list[list[float]],
     pred_video_c_t_h_w: torch.Tensor | None,
     fps: int,
+    dump_name: str | None = None,
 ) -> None:
     """
     Dump input observation, predicted actions, and rollout video for offline debugging.
@@ -318,8 +324,8 @@ def _save_policy_request_dump(
       - rollout_frames/frame_XXX.png (if pred_video provided)
     """
     ts = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S_%fZ")
-    out_dir = dump_root / f"{ts}_req{request_id:06d}"
-    out_dir.mkdir(parents=True, exist_ok=False)
+    out_dir = dump_root / dump_name if dump_name is not None else dump_root / f"{ts}_req{request_id:06d}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Save request JSON (without the base64 image to save space, image is saved separately)
     request_json_copy = {k: v for k, v in request_json.items() if k != "image"}
@@ -505,6 +511,8 @@ class ActionServerArgs(pydantic.BaseModel):
         base = OmniSetupOverrides.model_validate(self.checkpoint.model_dump())
         base.output_dir = output_dir
         base.sampler = self.sampler
+        # Action servers do not run prompt/video safety checks; skip gated HF downloads.
+        base.guardrails = False
         return base
 
 
@@ -536,6 +544,74 @@ class ActionServerConfig:
     action_normalization: ActionNormalization
     experiment_name: str
     checkpoint_dir: str
+
+
+def _resize_chw_uint8_to_height(img_chw_uint8: torch.Tensor, image_size: int) -> torch.Tensor:
+    """Resize a CHW uint8 frame so its height matches ``image_size``."""
+    _, img_h, img_w = img_chw_uint8.shape
+    if img_h == image_size:
+        return img_chw_uint8
+    scale = image_size / float(img_h)
+    new_w = int(round(img_w * scale))
+    hwc = img_chw_uint8.permute(1, 2, 0).cpu().numpy()  # [H,W,3]
+    resized = Image.fromarray(hwc).resize((new_w, image_size), resample=Image.Resampling.BILINEAR)
+    arr = np.asarray(resized, dtype=np.uint8).copy()
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # [3,H,W]
+
+
+def _decode_request_video_chw_uint8(
+    req: dict[str, Any],
+    *,
+    image_size: int,
+    target_frames: int,
+) -> torch.Tensor:
+    """Decode request image(s) into ``[3, T, H, W]`` uint8 video for policy inference."""
+    if target_frames <= 0:
+        raise ValueError(f"target_frames must be positive, got {target_frames}")
+
+    images_b64 = req.get("images")
+    image_b64 = req.get("image")
+    frames: list[torch.Tensor] = []
+
+    if isinstance(images_b64, list) and len(images_b64) > 0:
+        for item in images_b64:
+            if not isinstance(item, str):
+                raise ValueError("'images' entries must be base64 strings")
+            frames.append(_resize_chw_uint8_to_height(_decode_base64_png_to_rgb_uint8(item), image_size))
+    elif isinstance(image_b64, str):
+        frames.append(_resize_chw_uint8_to_height(_decode_base64_png_to_rgb_uint8(image_b64), image_size))
+    else:
+        raise ValueError("request must include 'image' or a non-empty 'images' list")
+
+    if len(frames) == 1:
+        return frames[0].unsqueeze(1).repeat(1, target_frames, 1, 1)  # [3,T,H,W]
+
+    if len(frames) >= target_frames:
+        selected = frames[-target_frames:]
+    else:
+        selected = list(frames)
+        while len(selected) < target_frames:
+            selected.append(frames[-1])
+    return torch.stack(selected, dim=0).permute(1, 0, 2, 3).contiguous()  # [3,T,H,W]
+
+
+def _request_dump_target(
+    req: dict[str, Any],
+    dump_dir: Path | None,
+    request_id: int,
+) -> tuple[Path, str] | None:
+    """Resolve dump directory and subfolder name for a policy request."""
+    dump_episode_dir = req.get("dump_episode_dir")
+    if isinstance(dump_episode_dir, str) and dump_episode_dir:
+        predict_index = req.get("predict_index")
+        if isinstance(predict_index, int):
+            dump_name = f"predict_{predict_index:03d}_req{request_id:06d}"
+        else:
+            dump_name = f"req{request_id:06d}"
+        return Path(dump_episode_dir), dump_name
+    if dump_dir is not None:
+        return Path(dump_dir), f"req{request_id:06d}"
+    return None
 
 
 class ActionModelService:
@@ -652,6 +728,11 @@ class ActionModelService:
         self.action_range: torch.Tensor | None = None
         self.action_mean: torch.Tensor | None = None
         self.action_std: torch.Tensor | None = None
+        self.state_action_min: torch.Tensor | None = None
+        self.state_action_range: torch.Tensor | None = None
+        self.state_action_mean: torch.Tensor | None = None
+        self.state_action_std: torch.Tensor | None = None
+        self.use_split_action_stats = False
         self.action_normalization: ResolvedActionNormalization = "minmax"
         self.raw_action_dim: int | None = self.cfg.raw_action_dim
         self._load_action_normalization_stats()
@@ -684,44 +765,85 @@ class ActionModelService:
             raw_stats = json.load(f)
         if not isinstance(raw_stats, dict):
             raise ValueError(f"Action stats file must contain a dict: {stats_path}")
+
+        if has_split_state_action_stats(raw_stats):
+            self.use_split_action_stats = True
+            action_stats = raw_stats["actions"]
+            state_stats = raw_stats["state"]
+            self._populate_action_stats_tensors(action_stats, stats_path, prefix="action")
+            self._populate_action_stats_tensors(state_stats, stats_path, prefix="state")
+            log.info(
+                f"[action-server] Loaded split RoboTwin action stats from {stats_path}: "
+                f"normalization={self.action_normalization}, "
+                f"action_rows={action_stats.get('num_rows')}, state_rows={state_stats.get('num_rows')}"
+            )
+            return
+
         stats_key = "global_raw" if self.action_normalization == "quantile_rot" else "global"
         stats = raw_stats.get(stats_key, raw_stats)
+        if isinstance(raw_stats.get("actions"), dict):
+            stats = raw_stats["actions"]
         if not isinstance(stats, dict):
             raise ValueError(f"Action stats file must contain a dict or {stats_key} stats dict: {stats_path}")
+        self._populate_action_stats_tensors(stats, stats_path, prefix="action")
+
+    def _populate_action_stats_tensors(
+        self,
+        stats: dict[str, Any],
+        stats_path: Path,
+        *,
+        prefix: str,
+    ) -> None:
+        min_attr = f"{prefix}_action_min" if prefix == "state" else "action_min"
+        range_attr = f"{prefix}_action_range" if prefix == "state" else "action_range"
+        mean_attr = f"{prefix}_action_mean" if prefix == "state" else "action_mean"
+        std_attr = f"{prefix}_action_std" if prefix == "state" else "action_std"
+
         if self.action_normalization == "meanstd":
             if "mean" not in stats or "std" not in stats:
                 raise ValueError(f"Mean/std action normalization requires 'mean' and 'std' in {stats_path}")
-            self.action_mean = torch.tensor(stats["mean"], dtype=torch.float32)  # [D]
-            action_std = torch.tensor(stats["std"], dtype=torch.float32)  # [D]
-            self.action_std = torch.clamp(action_std, min=1e-8)  # [D]
-            stats_dim = int(self.action_mean.shape[0])
-            stats_summary = f"mean={self.action_mean.tolist()}, std={self.action_std.tolist()}"
+            mean = torch.tensor(stats["mean"], dtype=torch.float32)
+            std = torch.clamp(torch.tensor(stats["std"], dtype=torch.float32), min=1e-8)
+            setattr(self, mean_attr, mean)
+            setattr(self, std_attr, std)
+            stats_dim = int(mean.shape[0])
+            stats_summary = f"mean={mean.tolist()}, std={std.tolist()}"
         elif self.action_normalization in ("quantile", "quantile_rot"):
             if "q01" not in stats or "q99" not in stats:
                 raise ValueError(f"Quantile action normalization requires 'q01' and 'q99' in {stats_path}")
-            self.action_min = torch.tensor(stats["q01"], dtype=torch.float32)  # [D]
-            action_max = torch.tensor(stats["q99"], dtype=torch.float32)  # [D]
-            action_range = action_max - self.action_min  # [D]
-            self.action_range = torch.clamp(action_range, min=1e-6)  # [D]
-            stats_dim = int(self.action_min.shape[0])
-            stats_summary = f"q01={self.action_min.tolist()}, q99={action_max.tolist()}"
+            action_min = torch.tensor(stats["q01"], dtype=torch.float32)
+            action_max = torch.tensor(stats["q99"], dtype=torch.float32)
+            action_range = torch.clamp(action_max - action_min, min=1e-6)
+            setattr(self, min_attr, action_min)
+            setattr(self, range_attr, action_range)
+            stats_dim = int(action_min.shape[0])
+            stats_summary = f"q01={action_min.tolist()}, q99={action_max.tolist()}"
         else:
             if "min" not in stats or "max" not in stats:
                 raise ValueError(f"Min/max action normalization requires 'min' and 'max' in {stats_path}")
-            self.action_min = torch.tensor(stats["min"], dtype=torch.float32)  # [D]
-            action_max = torch.tensor(stats["max"], dtype=torch.float32)  # [D]
-            action_range = action_max - self.action_min  # [D]
-            self.action_range = torch.clamp(action_range, min=1e-6)  # [D]
-            stats_dim = int(self.action_min.shape[0])
-            stats_summary = f"min={self.action_min.tolist()}, max={action_max.tolist()}"
-        if self.raw_action_dim is None:
-            self.raw_action_dim = stats_dim
-        if stats_dim != self.raw_action_dim:
-            raise ValueError(f"Action stats dimension {stats_dim} does not match raw_action_dim={self.raw_action_dim}")
-        log.info(
-            f"[action-server] Loaded action stats for denormalization from {stats_path}: "
-            f"normalization={self.action_normalization}, {stats_summary}"
-        )
+            action_min = torch.tensor(stats["min"], dtype=torch.float32)
+            action_max = torch.tensor(stats["max"], dtype=torch.float32)
+            action_range = torch.clamp(action_max - action_min, min=1e-6)
+            setattr(self, min_attr, action_min)
+            setattr(self, range_attr, action_range)
+            stats_dim = int(action_min.shape[0])
+            stats_summary = f"min={action_min.tolist()}, max={action_max.tolist()}"
+
+        if prefix == "action":
+            if self.raw_action_dim is None:
+                self.raw_action_dim = stats_dim
+            if stats_dim != self.raw_action_dim:
+                raise ValueError(
+                    f"Action stats dimension {stats_dim} does not match raw_action_dim={self.raw_action_dim}"
+                )
+            log.info(
+                f"[action-server] Loaded action stats for denormalization from {stats_path}: "
+                f"normalization={self.action_normalization}, {stats_summary}"
+            )
+        elif stats_dim != self.raw_action_dim:
+            raise ValueError(
+                f"State stats dimension {stats_dim} does not match raw_action_dim={self.raw_action_dim}"
+            )
 
     def _resolve_action_normalization(
         self, requested_normalization: ActionNormalization
@@ -744,22 +866,54 @@ class ActionModelService:
 
     def _denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """Invert the configured action normalization."""
-        if self.action_normalization == "meanstd":
-            if self.action_mean is None or self.action_std is None:
-                return action
-            action_dim = self.action_mean.shape[0]
-            normalized = action[..., :action_dim]  # [...,D]
-            action_mean = self.action_mean.to(action.device)  # [D]
-            action_std = self.action_std.to(action.device)  # [D]
-            return normalized * action_std + action_mean  # [...,D]
+        return self._denormalize_with_stats(action, prefix="action")
 
-        if self.action_min is None or self.action_range is None:
+    def _normalize_action_input(self, action: torch.Tensor) -> torch.Tensor:
+        """Apply action stats to raw model action values."""
+        return self._normalize_with_stats(action, prefix="action")
+
+    def _normalize_state_input(self, action: torch.Tensor) -> torch.Tensor:
+        """Apply state stats to raw qpos values prepended as action row 0."""
+        prefix = "state" if self.use_split_action_stats else "action"
+        return self._normalize_with_stats(action, prefix=prefix)
+
+    def _normalize_with_stats(self, action: torch.Tensor, *, prefix: str) -> torch.Tensor:
+        if self.cfg.action_stats_path is None:
             return action
-        action_dim = self.action_min.shape[0]
-        normalized = action[..., :action_dim]  # [...,D]
-        action_min = self.action_min.to(action.device)  # [D]
-        action_range = self.action_range.to(action.device)  # [D]
-        return (normalized + 1.0) / 2.0 * action_range + action_min  # [...,D]
+        if self.action_normalization == "meanstd":
+            mean = self.state_action_mean if prefix == "state" else self.action_mean
+            std = self.state_action_std if prefix == "state" else self.action_std
+            if mean is None or std is None:
+                return action
+            action_dim = mean.shape[0]
+            raw = action[..., :action_dim]
+            return (raw - mean.to(action.device)) / std.to(action.device)
+
+        action_min = self.state_action_min if prefix == "state" else self.action_min
+        action_range = self.state_action_range if prefix == "state" else self.action_range
+        if action_min is None or action_range is None:
+            return action
+        action_dim = action_min.shape[0]
+        raw = action[..., :action_dim]
+        return 2.0 * (raw - action_min.to(action.device)) / action_range.to(action.device) - 1.0
+
+    def _denormalize_with_stats(self, action: torch.Tensor, *, prefix: str) -> torch.Tensor:
+        if self.action_normalization == "meanstd":
+            mean = self.state_action_mean if prefix == "state" else self.action_mean
+            std = self.state_action_std if prefix == "state" else self.action_std
+            if mean is None or std is None:
+                return action
+            action_dim = mean.shape[0]
+            normalized = action[..., :action_dim]
+            return normalized * std.to(action.device) + mean.to(action.device)
+
+        action_min = self.state_action_min if prefix == "state" else self.action_min
+        action_range = self.state_action_range if prefix == "state" else self.action_range
+        if action_min is None or action_range is None:
+            return action
+        action_dim = action_min.shape[0]
+        normalized = action[..., :action_dim]
+        return (normalized + 1.0) / 2.0 * action_range.to(action.device) + action_min.to(action.device)
 
     # ------------------------------------------------------------------
     # HTTP plumbing
@@ -799,6 +953,16 @@ class ActionModelService:
             "raw_action_dim": self.cfg.raw_action_dim,
             "action_stats_path": str(self.cfg.action_stats_path) if self.cfg.action_stats_path else None,
         }
+
+    def _make_action_processing_batch_fields(self) -> dict[str, Any]:
+        """Batch fields required by ``generate_samples_from_batch`` action externalization."""
+        if self.raw_action_dim is None:
+            raise ValueError("raw_action_dim must be set before policy inference")
+        record = ActionProcessingRecord(
+            raw_action_dim=self.raw_action_dim,
+            action_normalizer=None,
+        )
+        return make_batched_action_processing_fields(record, batch_size=1)
 
     # ------------------------------------------------------------------
     # Predict
@@ -911,7 +1075,7 @@ class ActionModelService:
 
         batch: dict[str, Any] = {
             input_video_key: [[video_padded]],
-            "raw_action_dim": [torch.tensor(self.raw_action_dim, dtype=torch.long)],
+            **self._make_action_processing_batch_fields(),
             "action": [[action_t_d]],
             "mode": ["policy"],
             "ai_caption": [augmented_prompt],

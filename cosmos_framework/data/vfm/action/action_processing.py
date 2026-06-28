@@ -88,6 +88,77 @@ def load_action_stats(stats_path: str, stats_key: str = "global") -> dict[str, n
     return {k: np.array(v, dtype=np.float32) for k, v in raw.items() if k in stat_keys}
 
 
+def _stats_block_to_torch(stats: dict[str, Any]) -> dict[str, torch.Tensor]:
+    stat_keys = {"mean", "std", "min", "max", "q01", "q99"}
+    return {key: torch.tensor(stats[key], dtype=torch.float32) for key in stat_keys if key in stats}
+
+
+def has_split_state_action_stats(raw_stats: dict[str, Any]) -> bool:
+    """Return True when stats JSON contains separate ``state`` and ``actions`` blocks."""
+    return (
+        isinstance(raw_stats.get("state"), dict)
+        and isinstance(raw_stats.get("actions"), dict)
+        and any(key in raw_stats["state"] for key in ("q01", "q99", "mean", "std", "min", "max"))
+        and any(key in raw_stats["actions"] for key in ("q01", "q99", "mean", "std", "min", "max"))
+    )
+
+
+@dataclass(frozen=True)
+class StateActionSplitNormalizer:
+    """Normalize row 0 (absolute state) and rows 1..T (actions) with separate stats."""
+
+    state_normalizer: ActionAffineNormalization
+    action_normalizer: ActionAffineNormalization
+    use_state_row: bool = True
+
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        if not self.use_state_row or action.shape[0] <= 1:
+            return self.action_normalizer.normalize_action(action)
+        normalized = action.clone()
+        normalized[0] = self.state_normalizer.normalize_action(action[0])
+        if action.shape[0] > 1:
+            normalized[1:] = self.action_normalizer.normalize_action(action[1:])
+        return normalized
+
+    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        if not self.use_state_row or action.shape[0] <= 1:
+            return self.action_normalizer.denormalize_action(action)
+        denormalized = action.clone()
+        denormalized[0] = self.state_normalizer.denormalize_action(action[0])
+        if action.shape[0] > 1:
+            denormalized[1:] = self.action_normalizer.denormalize_action(action[1:])
+        return denormalized
+
+
+def resolve_state_action_normalizer(
+    method: ActionNormalizationMethod,
+    stats_path: str | Path,
+    *,
+    use_state: bool,
+) -> ActionNormalizer:
+    """Build a normalizer from flat or split RoboTwin action stats JSON."""
+    path = Path(stats_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Action normalization stats not found at {stats_path}.")
+    with path.open("r", encoding="utf-8") as handle:
+        raw_stats = json.load(handle)
+    if not isinstance(raw_stats, dict):
+        raise TypeError(f"Action stats file must contain a dict: {stats_path}")
+
+    if use_state and has_split_state_action_stats(raw_stats):
+        state_stats = _stats_block_to_torch(raw_stats["state"])
+        action_stats = _stats_block_to_torch(raw_stats["actions"])
+        return StateActionSplitNormalizer(
+            state_normalizer=resolve_action_normalization(method, state_stats),
+            action_normalizer=resolve_action_normalization(method, action_stats),
+            use_state_row=True,
+        )
+
+    stats_key = "actions" if isinstance(raw_stats.get("actions"), dict) else "global"
+    flat_stats = _stats_block_to_torch(load_action_stats(str(path), stats_key=stats_key))
+    return resolve_action_normalization(method, flat_stats)
+
+
 def resolve_action_normalization(
     method: ActionNormalizationMethod,
     stats: dict[str, torch.Tensor],

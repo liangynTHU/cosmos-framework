@@ -114,3 +114,4 @@ max_samples_per_batch = 128
 wam_mode            = "fastwam_action_only"
 future_video_frames = 16
 action_horizon      = 16
+action_normalization = "quantile"

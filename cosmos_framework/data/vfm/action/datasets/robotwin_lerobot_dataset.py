@@ -18,8 +18,28 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from cosmos_framework.data.vfm.action.action_processing import (
+    ActionNormalizer,
+    resolve_state_action_normalizer,
+)
 from cosmos_framework.data.vfm.action.domain_utils import get_domain_id
+from cosmos_framework.data.vfm.action.robotwin_action import (
+    RobotTwinActionSpace,
+    dual_arm_joints_to_absolute_ee_pose_action,
+    dual_arm_joints_to_ee_pose_delta_action,
+    joint_trajectory_to_backward_anchored_delta,
+    raw_action_dim_for_space,
+    validate_action_space,
+)
 from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
+
+_STATS_DIR = Path(__file__).parent / "stats"
+_STATS_PATH_BY_ACTION_SPACE: dict[RobotTwinActionSpace, Path] = {
+    "joint_pos": _STATS_DIR / "robotwin_lerobot_stats.json",
+    "joint_delta": _STATS_DIR / "robotwin_lerobot_joint_delta_stats.json",
+    "ee_pose_delta": _STATS_DIR / "robotwin_lerobot_ee_pose_delta_stats.json",
+}
+_STATS_PATH = _STATS_PATH_BY_ACTION_SPACE["joint_pos"]
 
 _DEFAULT_CAMERA_KEY = "observation.images.cam_high"
 _DEFAULT_WRIST_CAMERA_KEYS = ("observation.images.cam_left_wrist", "observation.images.cam_right_wrist")
@@ -78,6 +98,9 @@ class RobotTwinLeRobotDataset(Dataset):
         mode: str = "forward_dynamics",
         tolerance_s: float = 2e-4,
         normalize_action: bool = False,
+        action_normalization: str | None = None,
+        action_stats_path: str | None = None,
+        action_space: str = "joint_pos",
         wam_mode: str = "cosmos_default",
         future_video_frames: int | None = None,
         action_horizon: int | None = None,
@@ -117,6 +140,16 @@ class RobotTwinLeRobotDataset(Dataset):
         self._mode = mode
         self._tolerance_s = float(tolerance_s)
         self._normalize_action = bool(normalize_action)
+        if action_normalization is not None and normalize_action:
+            raise ValueError(
+                "Use either action_normalization or legacy normalize_action=True (clamp only), not both."
+            )
+        self._action_normalization = action_normalization
+        self._action_space = validate_action_space(action_space)
+        if action_stats_path is not None:
+            self._action_stats_path = Path(action_stats_path)
+        else:
+            self._action_stats_path = _STATS_PATH_BY_ACTION_SPACE[self._action_space]
         self._caption_prefix = caption_prefix.strip()
         self._max_episodes = max_episodes
         self._task_index = int(task_index) if task_index is not None else None
@@ -169,6 +202,14 @@ class RobotTwinLeRobotDataset(Dataset):
 
     @property
     def action_dim(self) -> int:
+        return raw_action_dim_for_space(self._action_space)
+
+    @property
+    def action_space(self) -> RobotTwinActionSpace:
+        return self._action_space
+
+    @property
+    def joint_dim(self) -> int:
         return 14
 
     @property
@@ -186,6 +227,23 @@ class RobotTwinLeRobotDataset(Dataset):
     @property
     def observation_image_mode(self) -> str:
         return self._observation_image_mode
+
+    @property
+    def action_normalization(self) -> str | None:
+        return self._action_normalization
+
+    @classmethod
+    def default_stats_path(cls, action_space: str = "joint_pos") -> Path:
+        return _STATS_PATH_BY_ACTION_SPACE[validate_action_space(action_space)]
+
+    def build_action_normalizer(self) -> ActionNormalizer | None:
+        if self._action_normalization is None:
+            return None
+        return resolve_state_action_normalizer(
+            self._action_normalization,
+            self._action_stats_path,
+            use_state=self._use_state,
+        )
 
     def __len__(self) -> int:
         base_len = self._cumulative_sizes[-1] if self._cumulative_sizes else 0
@@ -207,16 +265,10 @@ class RobotTwinLeRobotDataset(Dataset):
         video_rows = rows[: self._future_video_frames + 1] if self._fastwam_action_only else rows
         video = self._load_video(episode, video_rows)
         action_valid_mask = torch.zeros(self._action_horizon, dtype=torch.bool)
-        action_values = []
-        action_start_row = 1 if self._use_state else 0
         for step in range(self._action_horizon):
-            row_idx = min(action_start_row + step, len(rows) - 1)
-            action_values.append(rows[row_idx]["action"])
+            action_start_row = 1 if self._use_state else 0
             action_valid_mask[step] = start_frame + action_start_row + step < max_available_frames
-        action = torch.tensor(action_values, dtype=torch.float32)
-        if self._use_state:
-            initial_state = self._extract_state(rows[0]).unsqueeze(0)
-            action = torch.cat([initial_state, action], dim=0)
+        action = self._build_action_chunk(rows)
         if self._normalize_action:
             action = action.clamp(-1.0, 1.0)
 
@@ -243,6 +295,7 @@ class RobotTwinLeRobotDataset(Dataset):
             "episode_index": torch.tensor(int(episode["episode_index"]), dtype=torch.long),
             "task_index": torch.tensor(sample_task_index, dtype=torch.long),
             "frame_index": torch.tensor(start_frame, dtype=torch.long),
+            "action_space": self._action_space,
         }
         if self._fastwam_action_only:
             future_video_valid_mask = torch.zeros(self._future_video_frames, dtype=torch.bool)
@@ -272,6 +325,45 @@ class RobotTwinLeRobotDataset(Dataset):
             sample["observation_image_mode"] = "multi_image"
         return sample
 
+    def _absolute_joint_trajectory(self, rows: list[dict[str, Any]]) -> torch.Tensor:
+        """Absolute 14D joint targets ``[T, 14]`` from LeRobot rows."""
+        return torch.stack([self._extract_state(row) for row in rows], dim=0)
+
+    def _build_action_chunk(self, rows: list[dict[str, Any]]) -> torch.Tensor:
+        """Build the model action chunk for the configured ``action_space``."""
+        trajectory = self._absolute_joint_trajectory(rows)
+        if self._action_space == "joint_pos":
+            targets = trajectory[1 : 1 + self._action_horizon]
+            if targets.shape[0] < self._action_horizon:
+                pad = targets[-1:].repeat(self._action_horizon - targets.shape[0], 1)
+                targets = torch.cat([targets, pad], dim=0)
+            if self._use_state:
+                return torch.cat([trajectory[:1], targets], dim=0)
+            return targets
+
+        if self._action_space == "joint_delta":
+            deltas = joint_trajectory_to_backward_anchored_delta(trajectory)
+            horizon_deltas = deltas[: self._action_horizon]
+            if horizon_deltas.shape[0] < self._action_horizon:
+                pad = horizon_deltas[-1:].repeat(self._action_horizon - horizon_deltas.shape[0], 1)
+                horizon_deltas = torch.cat([horizon_deltas, pad], dim=0)
+            if self._use_state:
+                return torch.cat([trajectory[:1], horizon_deltas], dim=0)
+            return horizon_deltas
+
+        if self._action_space == "ee_pose_delta":
+            ee_action = dual_arm_joints_to_ee_pose_delta_action(trajectory)
+            horizon = ee_action[: self._action_horizon]
+            if horizon.shape[0] < self._action_horizon:
+                pad = horizon[-1:].repeat(self._action_horizon - horizon.shape[0], 1)
+                horizon = torch.cat([horizon, pad], dim=0)
+            if self._use_state:
+                initial_state = dual_arm_joints_to_absolute_ee_pose_action(trajectory[:1])
+                return torch.cat([initial_state, horizon], dim=0)
+            return horizon
+
+        raise ValueError(f"Unsupported action_space {self._action_space!r}")
+
     def _load_tasks(self) -> dict[int, str]:
         tasks: dict[int, str] = {}
         with (self._root / "meta" / "tasks.jsonl").open("r", encoding="utf-8") as f:
@@ -289,9 +381,9 @@ class RobotTwinLeRobotDataset(Dataset):
             if key not in row or row[key] is None:
                 continue
             state = np.asarray(row[key], dtype=np.float32).reshape(-1)
-            if state.size != self.action_dim:
+            if state.size != self.joint_dim:
                 raise ValueError(
-                    f"RoboTwin state field {key!r} has dim={state.size}, expected {self.action_dim}. "
+                    f"RoboTwin state field {key!r} has dim={state.size}, expected {self.joint_dim}. "
                     "Set dataset.state_key to a 14D qpos/proprio field or disable dataset.use_state."
                 )
             return torch.from_numpy(state.copy()).float()
@@ -469,23 +561,30 @@ class RobotTwinLeRobotDataset(Dataset):
 class _TransformedRobotTwinLeRobotDataset(Dataset):
     """Apply the Action SFT transform pipeline lazily on RoboTwin samples."""
 
-    def __init__(self, dataset: RobotTwinLeRobotDataset, transform: ActionTransformPipeline, resolution: str | None) -> None:
+    def __init__(
+        self,
+        dataset: RobotTwinLeRobotDataset,
+        transform: ActionTransformPipeline,
+        resolution: str | None,
+        action_normalizer: ActionNormalizer | None = None,
+    ) -> None:
         self.dataset = dataset
         self.transform = transform
         self.resolution = resolution
+        self.action_normalizer = action_normalizer
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         sample = self.dataset[idx]
-        return self.transform(sample, self.resolution)
+        return self.transform(sample, self.resolution, action_normalizer=self.action_normalizer)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.dataset, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in {"dataset", "transform", "resolution"} or "dataset" not in self.__dict__:
+        if name in {"dataset", "transform", "resolution", "action_normalizer"} or "dataset" not in self.__dict__:
             super().__setattr__(name, value)
         else:
             setattr(self.dataset, name, value)
@@ -502,6 +601,9 @@ def get_robotwin_lerobot_sft_dataset(
     mode: str = "forward_dynamics",
     tolerance_s: float = 2e-4,
     normalize_action: bool = False,
+    action_normalization: str | None = "quantile",
+    action_stats_path: str | None = None,
+    action_space: str = "joint_pos",
     wam_mode: str = "cosmos_default",
     future_video_frames: int | None = None,
     action_horizon: int | None = None,
@@ -543,6 +645,9 @@ def get_robotwin_lerobot_sft_dataset(
         mode=mode,
         tolerance_s=tolerance_s,
         normalize_action=normalize_action,
+        action_normalization=action_normalization,
+        action_stats_path=action_stats_path,
+        action_space=action_space,
         wam_mode=wam_mode,
         future_video_frames=future_video_frames,
         action_horizon=action_horizon,
@@ -568,4 +673,5 @@ def get_robotwin_lerobot_sft_dataset(
         format_prompt_as_json=format_prompt_as_json,
         add_camera_tokens=observation_image_mode == "multi_image",
     )
-    return _TransformedRobotTwinLeRobotDataset(dataset, transform, resolution)
+    action_normalizer = dataset.build_action_normalizer()
+    return _TransformedRobotTwinLeRobotDataset(dataset, transform, resolution, action_normalizer)

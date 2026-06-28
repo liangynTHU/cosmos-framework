@@ -86,3 +86,7 @@ max_samples_per_batch = 128
 [dataloader_train.dataloader.datasets.robotwin.dataset]
 use_state = true
 state_key = "observation.state"
+action_normalization = "quantile"
+action_space = "joint_delta"
+# action_space = "joint_pos"      # absolute 14D joint targets
+# action_space = "ee_pose_delta"  # SE(3) deltas per arm (requires FK)

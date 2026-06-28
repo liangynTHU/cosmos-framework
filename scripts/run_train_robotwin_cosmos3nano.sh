@@ -150,6 +150,12 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 WANDB_PROJECT="${WANDB_PROJECT:-cosmos3}"
 WANDB_GROUP="${WANDB_GROUP:-robotwin_lerobot_action_sft}"
 WANDB_NAME="${WANDB_NAME:-cosmos3nano_robotwin_n${NNODES}x${NPROC_PER_NODE}_$(date +%Y%m%d_%H%M%S)}"
+export WANDB_PROJECT WANDB_GROUP WANDB_NAME
+
+if [[ "${NODE_RANK:-0}" == "0" ]]; then
+    # shellcheck disable=SC1091
+    source "$WORKDIR/scripts/compute_training_robotwin_action_stats.sh"
+fi
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/apdcephfs_gy7/share_305004851/hunyuan/yinanliang/wam/fastwam/wandb_api_key}"
 LOG_FILENAME="${LOG_FILENAME:-robotwin_lerobot_action_sft_nano_n${NNODES}_rank${NODE_RANK}.log}"
@@ -270,6 +276,10 @@ fi
 
 OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.dataset_repeat=${ROBOTWIN_DATASET_REPEAT:-1}")
 
+if [[ -n "${ROBOTWIN_ACTION_STATS_PATH:-}" ]]; then
+    OVERRIDES+=("dataloader_train.dataloader.datasets.robotwin.dataset.action_stats_path=$ROBOTWIN_ACTION_STATS_PATH")
+fi
+
 OVERRIDES+=("${EXTRA_OVERRIDES[@]}")
 
 echo "=========================================="
@@ -294,6 +304,8 @@ echo "TOML_FILE=$TOML_FILE"
 echo "TRAINING_NAME=$TRAINING_NAME"
 echo "OUTPUT_BASE_ROOT=$OUTPUT_BASE_ROOT"
 echo "OUTPUT_ROOT=$OUTPUT_ROOT"
+echo "TRAINING_RUN_DIR=${TRAINING_RUN_DIR:-$IMAGINAIRE_OUTPUT_ROOT/$WANDB_PROJECT/$WANDB_GROUP/$WANDB_NAME}"
+echo "ROBOTWIN_ACTION_STATS_PATH=${ROBOTWIN_ACTION_STATS_PATH:-}"
 echo "WANDB_PROJECT=$WANDB_PROJECT WANDB_GROUP=$WANDB_GROUP WANDB_NAME=$WANDB_NAME WANDB_MODE=$WANDB_MODE"
 echo "ROBOTWIN_USE_STATE=${ROBOTWIN_USE_STATE:-true}"
 echo "ROBOTWIN_STATE_KEY=${ROBOTWIN_STATE_KEY:-observation.state}"

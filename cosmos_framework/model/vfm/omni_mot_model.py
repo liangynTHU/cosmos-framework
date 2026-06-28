@@ -187,7 +187,7 @@ class OmniMoTModel(ImaginaireModel):
         vlm_tokenizer = self.vlm_processor.tokenizer
         vlm_tokenizer, special_tokens = add_special_tokens(
             vlm_tokenizer,
-            add_camera_tokens=self.config.use_camera_special_tokens,
+            add_camera_tokens=getattr(self.config, "use_camera_special_tokens", False),
         )
         self.vlm_tokenizer = vlm_tokenizer
 
@@ -225,7 +225,7 @@ class OmniMoTModel(ImaginaireModel):
         while ``ExtendedTokenEmbedding.extra_weight`` learns only the new camera
         marker rows.
         """
-        if not self.config.use_camera_special_tokens:
+        if not getattr(self.config, "use_camera_special_tokens", False):
             return
 
         tokenizer_vocab_size = len(self.vlm_tokenizer)

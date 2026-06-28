@@ -79,6 +79,10 @@ Common environment variables:
   ROBOTWIN_STATE_KEY           qpos/proprio parquet field, default observation.state.
   OBSERVATION_IMAGE_MODE       concat or multi_image. concat keeps the legacy single concatenated observation.
   ROBOTWIN_VIEWPOINT           Optional dataset viewpoint override. Set to concat_view for the three-camera baseline.
+  ROBOTWIN_ACTION_SPACE        joint_pos / joint_delta / ee_pose_delta. Default joint_delta when unset in subset launchers.
+  COMPUTE_ACTION_STATS         When true (default), compute quantile stats for the training subset before launch.
+  FORCE_RECOMPUTE_ACTION_STATS Rebuild stats even if TRAINING_RUN_DIR/action_stats.json already exists.
+  ROBOTWIN_ACTION_STATS_PATH   Override stats output path. Default: TRAINING_RUN_DIR/action_stats.json
   OPTIMIZER_LR                 Optional optimizer base lr override.
   SCHEDULER_F_MAX/F_MIN        Optional scheduler multiplier overrides.
   SCHEDULER_WARM_UP_STEPS      Optional scheduler warm-up override.
@@ -144,8 +148,18 @@ if [[ "$TRAINING_NAME" == */* ]]; then
 fi
 OUTPUT_BASE_ROOT="${OUTPUT_BASE_ROOT:-/apdcephfs_gy7/share_305004851/hunyuan/yinanliang/wam/cosmos3/outputs/train_robotwin_cosmos3nano}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$OUTPUT_BASE_ROOT/$TRAINING_NAME}"
+IMAGINAIRE_OUTPUT_ROOT="${IMAGINAIRE_OUTPUT_ROOT:-$OUTPUT_ROOT}"
+WANDB_PROJECT="${WANDB_PROJECT:-cosmos3}"
+WANDB_GROUP="${WANDB_GROUP:-robotwin_lerobot_action_sft}"
 
-export NODE_IP_LIST EXP_IP_LIST NNODES MASTER_ADDR MASTER_PORT NPROC_PER_NODE WANDB_NAME TRAINING_NAME OUTPUT_BASE_ROOT OUTPUT_ROOT
+export NODE_IP_LIST EXP_IP_LIST NNODES MASTER_ADDR MASTER_PORT NPROC_PER_NODE \
+  WANDB_PROJECT WANDB_GROUP WANDB_NAME TRAINING_NAME OUTPUT_BASE_ROOT OUTPUT_ROOT IMAGINAIRE_OUTPUT_ROOT
+
+# Compute action stats on the training subset before launching workers.
+# Stats are written to $TRAINING_RUN_DIR/action_stats.json by default.
+# shellcheck disable=SC1091
+source "$COSMOS_WORKDIR/scripts/compute_training_robotwin_action_stats.sh"
+export ROBOTWIN_ACTION_STATS_PATH
 
 echo "=========================================="
 echo "Cosmos3-Nano RoboTwin pdsh launcher"
@@ -155,7 +169,9 @@ echo "EXP_IP_LIST=$EXP_IP_LIST"
 echo "NNODES=$NNODES MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT NPROC_PER_NODE=$NPROC_PER_NODE"
 echo "TRAINING_NAME=$TRAINING_NAME"
 echo "OUTPUT_ROOT=$OUTPUT_ROOT"
+echo "TRAINING_RUN_DIR=${TRAINING_RUN_DIR:-$IMAGINAIRE_OUTPUT_ROOT/$WANDB_PROJECT/$WANDB_GROUP/$WANDB_NAME}"
 echo "WANDB_NAME=$WANDB_NAME"
+echo "ROBOTWIN_ACTION_STATS_PATH=${ROBOTWIN_ACTION_STATS_PATH:-}"
 echo "EXTRA_OVERRIDES=$SCRIPT_ARGS_STR"
 
 IFS=',' read -ra IP_ARRAY <<< "$EXP_IP_LIST"
@@ -231,6 +247,14 @@ for i in "${!IP_ARRAY[@]}"; do
         "TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
         "NCCL_TIMEOUT=${NCCL_TIMEOUT:-1800}"
     )
+
+    if [[ -n "${ROBOTWIN_ACTION_STATS_PATH:-}" ]]; then
+        REMOTE_ENV_ARGS+=("ROBOTWIN_ACTION_STATS_PATH=$ROBOTWIN_ACTION_STATS_PATH")
+    fi
+
+    if [[ -n "${ROBOTWIN_ACTION_SPACE:-}" ]]; then
+        REMOTE_ENV_ARGS+=("ROBOTWIN_ACTION_SPACE=$ROBOTWIN_ACTION_SPACE")
+    fi
 
     if [[ -n "${MAX_EPISODES+x}" ]]; then
         REMOTE_ENV_ARGS+=("MAX_EPISODES=$MAX_EPISODES")
